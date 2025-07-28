@@ -1,0 +1,165 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
+from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
+from kubernetes.config.config_exception import ConfigException
+
+from nemo_run.core.packaging.base import Packager
+
+logger = logging.getLogger(__name__)
+
+# Kubernetes ConfigMap has 1MB limit per key, but we'll use a conservative limit
+MAX_CONFIGMAP_SIZE = 1024 * 1024  # 1MB
+
+
+@dataclass(kw_only=True)
+class ConfigMapPackager(Packager):
+    """
+    Packages files into a Kubernetes ConfigMap for use in distributed jobs.
+    """
+
+    include_pattern: str | List[str] = "*.py"
+    relative_path: str | List[str] = "."
+    namespace: str = "default"
+    configmap_prefix: str = "nemo-workspace"
+
+    def __post_init__(self):
+        """
+        Initialize the Kubernetes client.
+        """
+        try:
+            try:
+                config.load_incluster_config()
+                logger.info("Loaded in-cluster Kubernetes config")
+            except ConfigException:
+                config.load_kube_config()
+                logger.info("Loaded kubeconfig from default location")
+            self.v1 = client.CoreV1Api()
+        except Exception as e:
+            logger.warning(f"Failed to initialize Kubernetes client: {e}")
+            self.v1 = None
+
+    def package(self, path: Path, job_dir: str, name: str) -> str:
+        """
+        Package files into a Kubernetes ConfigMap.
+        Args:
+            path: Base path to search for files
+            job_dir: Directory prefix for organizing files within the ConfigMap
+            name: Name for the ConfigMap
+        Returns:
+            The name of the created ConfigMap (or intended name if not created)
+        """
+        if self.v1 is None:
+            logger.warning("Kubernetes client not available, skipping ConfigMap creation")
+            return f"{self.configmap_prefix}-{name}"
+
+        configmap_name = f"{self.configmap_prefix}-{name}"
+        files_to_stage = self._find_files_to_package(path)
+        if not files_to_stage:
+            logger.warning("No files found to package into ConfigMap")
+            return configmap_name
+
+        # Check total size of files to be staged
+        total_size = sum(file_path.stat().st_size for file_path in files_to_stage)
+        if total_size > MAX_CONFIGMAP_SIZE:
+            logger.error(
+                f"Total file size ({total_size} bytes) exceeds ConfigMap limit ({MAX_CONFIGMAP_SIZE} bytes). "
+                f"Consider using a different staging method for large files."
+            )
+            return configmap_name
+
+        if self.debug:
+            logger.debug(
+                f"Found {len(files_to_stage)} files to package (total size: {total_size} bytes)"
+            )
+            for file_path in files_to_stage:
+                logger.debug(f"  - {file_path} ({file_path.stat().st_size} bytes)")
+
+        configmap_data = {}
+        for file_path in files_to_stage:
+            rel_path = file_path.relative_to(path)
+            # Use job_dir as prefix to organize files within the ConfigMap
+            configmap_key = f"{job_dir}/{rel_path}" if job_dir else str(rel_path)
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    configmap_data[configmap_key] = f.read()
+            except Exception as e:
+                logger.warning(f"Could not read file {file_path}: {e}")
+
+        if not configmap_data:
+            logger.warning("No files could be read for ConfigMap")
+            return configmap_name
+
+        body = client.V1ConfigMap(
+            metadata=client.V1ObjectMeta(name=configmap_name), data=configmap_data
+        )
+        try:
+            self.v1.create_namespaced_config_map(namespace=self.namespace, body=body)
+            logger.info(f"Created ConfigMap: {configmap_name} with {len(configmap_data)} files")
+        except ApiException as e:
+            if e.status == 409:
+                logger.info(f"ConfigMap {configmap_name} already exists")
+            else:
+                logger.error(f"Failed to create ConfigMap {configmap_name}: {e}")
+        return configmap_name
+
+    def _find_files_to_package(self, base_path: Path) -> List[Path]:
+        """
+        Find files to package based on include_pattern and relative_path.
+        Args:
+            base_path: The base directory to search from
+        Returns:
+            List of Path objects for files to include
+        """
+        files = []
+        patterns = (
+            [self.include_pattern]
+            if isinstance(self.include_pattern, str)
+            else self.include_pattern
+        )
+        rel_paths = (
+            [self.relative_path] if isinstance(self.relative_path, str) else self.relative_path
+        )
+        for pattern, rel_path in zip(patterns, rel_paths):
+            search_path = base_path / rel_path
+            if search_path.exists():
+                for file_path in search_path.rglob(pattern):
+                    if file_path.is_file():
+                        files.append(file_path)
+        return sorted(set(files))
+
+    def cleanup(self, name: str) -> None:
+        """
+        Delete the ConfigMap from Kubernetes.
+        Args:
+            name: The name suffix of the ConfigMap to delete
+        """
+        if self.v1 is None:
+            return
+        configmap_name = f"{self.configmap_prefix}-{name}"
+        try:
+            self.v1.delete_namespaced_config_map(name=configmap_name, namespace=self.namespace)
+            logger.info(f"Cleaned up ConfigMap: {configmap_name}")
+        except ApiException as e:
+            if e.status == 404:
+                logger.info(f"ConfigMap {configmap_name} not found")
+            else:
+                logger.error(f"Failed to clean up ConfigMap {configmap_name}: {e}")
