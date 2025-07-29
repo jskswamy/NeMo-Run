@@ -55,6 +55,10 @@ lepton = "nemo_run.run.torchx_backend.schedulers.lepton:create_scheduler"
 skypilot = ["skypilot[kubernetes]>=0.10.0"]
 skypilot-all = ["skypilot[all]>=0.10.0"]
 ray = ["kubernetes"]
+kubernetes = [
+    "kubernetes>=28.0.0",
+    "kubeflow @ git+https://github.com/jskswamy/kubeflow-sdk.git#subdirectory=python",
+]
 
 [dependency-groups]
 dev = [
