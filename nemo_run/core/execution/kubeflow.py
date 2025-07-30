@@ -28,6 +28,22 @@ from nemo_run.core.packaging.configmap import ConfigMapPackager
 logger = logging.getLogger(__name__)
 
 
+def sanitize_kubernetes_name(name: str) -> str:
+    """
+    Sanitize a string to be used as a Kubernetes resource name.
+
+    Replaces underscores with hyphens to comply with RFC 1123 subdomain rules.
+    This is a common pattern used across the codebase for Kubernetes resource naming.
+
+    Args:
+        name: The string to sanitize
+
+    Returns:
+        A sanitized string suitable for use as a Kubernetes resource name
+    """
+    return name.replace("_", "-")
+
+
 @dataclass(kw_only=True)
 class KubeflowExecutor(Executor):
     """
@@ -164,17 +180,11 @@ class KubeflowExecutor(Executor):
 
     def _get_custom_trainer(self) -> CustomTrainer:
         """Get the CustomTrainer configuration for the training job."""
+        # Create a flat resources dictionary as expected by the Kubeflow SDK
         resources_per_node = {
-            "limits": {
-                "cpu": self.cpu_limit,
-                "memory": self.memory_limit,
-                "nvidia.com/gpu": str(self.gpus),
-            },
-            "requests": {
-                "cpu": self.cpu_request,
-                "memory": self.memory_request,
-                "nvidia.com/gpu": str(self.gpus),
-            },
+            "cpu": self.cpu_limit,
+            "memory": self.memory_limit,
+            "nvidia.com/gpu": str(self.gpus),
         }
 
         # Create CustomTrainer with either python_file or func
@@ -241,13 +251,25 @@ class KubeflowExecutor(Executor):
             logger.error(f"Failed to get TrainJob logs: {e}")
             return {}
 
+    def _get_sanitized_configmap_name(self, task_dir: str) -> str:
+        """Get a sanitized ConfigMap name that complies with Kubernetes naming rules."""
+        sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
+        sanitized_task_dir = sanitize_kubernetes_name(task_dir)
+        configmap_name = f"{sanitized_experiment_id}-{sanitized_task_dir}"
+        logger.debug(f"Original experiment_id: {self.experiment_id}, task_dir: {task_dir}")
+        logger.debug(f"Sanitized ConfigMap name: {configmap_name}")
+        return configmap_name
+
     def stage_files(self, task_dir: str) -> str:
         """Stage files using the ConfigMapPackager."""
         if isinstance(self.packager, ConfigMapPackager):
+            configmap_name = self._get_sanitized_configmap_name(task_dir)
+            # Also sanitize the job_dir parameter to ensure ConfigMap keys are valid
+            sanitized_task_dir = sanitize_kubernetes_name(task_dir)
             return self.packager.package(
                 path=Path(self.experiment_dir),
-                job_dir=task_dir,
-                name=f"{self.experiment_id}-{task_dir}",
+                job_dir=sanitized_task_dir,
+                name=configmap_name,
             )
         else:
             logger.warning("Non-ConfigMapPackager used, file staging may not work as expected")
@@ -256,7 +278,8 @@ class KubeflowExecutor(Executor):
     def cleanup_files(self, task_dir: str):
         """Clean up staged files."""
         if isinstance(self.packager, ConfigMapPackager):
-            self.packager.cleanup(f"{self.experiment_id}-{task_dir}")
+            configmap_name = self._get_sanitized_configmap_name(task_dir)
+            self.packager.cleanup(configmap_name)
 
     def info(self) -> str:
         """Return information about this executor."""

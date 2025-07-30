@@ -16,7 +16,7 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
@@ -57,6 +57,26 @@ class ConfigMapPackager(Packager):
             logger.warning(f"Failed to initialize Kubernetes client: {e}")
             self.v1 = None
 
+    def _sanitize_configmap_key(self, job_dir: Optional[str], rel_path: Path) -> str:
+        """
+        Sanitize a ConfigMap key to comply with Kubernetes ConfigMap key rules.
+
+        Kubernetes ConfigMap keys cannot contain forward slashes (/), so we replace
+        them with hyphens (-). This method creates a key that organizes files within
+        the ConfigMap using the job_dir as a prefix.
+
+        Args:
+            job_dir: Directory prefix for organizing files within the ConfigMap (can be None)
+            rel_path: Relative path of the file from the base directory
+
+        Returns:
+            A sanitized ConfigMap key that complies with Kubernetes naming rules
+        """
+        # Use job_dir as prefix to organize files within the ConfigMap
+        configmap_key = f"{job_dir}/{rel_path}" if job_dir else str(rel_path)
+        # Replace forward slashes with hyphens to comply with Kubernetes ConfigMap key rules
+        return configmap_key.replace("/", "-")
+
     def package(self, path: Path, job_dir: str, name: str) -> str:
         """
         Package files into a Kubernetes ConfigMap.
@@ -96,8 +116,8 @@ class ConfigMapPackager(Packager):
         configmap_data = {}
         for file_path in files_to_stage:
             rel_path = file_path.relative_to(path)
-            # Use job_dir as prefix to organize files within the ConfigMap
-            configmap_key = f"{job_dir}/{rel_path}" if job_dir else str(rel_path)
+            # Use the sanitization method to create a valid ConfigMap key
+            configmap_key = self._sanitize_configmap_key(job_dir, rel_path)
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     configmap_data[configmap_key] = f.read()

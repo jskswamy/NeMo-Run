@@ -1,8 +1,299 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from nemo_run.core.packaging.configmap import ConfigMapPackager
+
+
+class TestConfigMapPackager:
+    """Test cases for the ConfigMapPackager class."""
+
+    def test_configmap_packager_default_init(self):
+        """Test that ConfigMapPackager initializes with default values."""
+        packager = ConfigMapPackager()
+
+        assert packager.include_pattern == "*.py"
+        assert packager.relative_path == "."
+        assert packager.namespace == "default"
+        assert packager.configmap_prefix == "nemo-workspace"
+
+    def test_configmap_packager_custom_init(self):
+        """Test that ConfigMapPackager initializes with custom values."""
+        packager = ConfigMapPackager(
+            include_pattern=["*.py", "*.yaml"],
+            relative_path=["src", "config"],
+            namespace="training",
+            configmap_prefix="custom-prefix",
+        )
+
+        assert packager.include_pattern == ["*.py", "*.yaml"]
+        assert packager.relative_path == ["src", "config"]
+        assert packager.namespace == "training"
+        assert packager.configmap_prefix == "custom-prefix"
+
+    @pytest.mark.parametrize(
+        "job_dir,rel_path,expected_key",
+        [
+            # Basic cases with job_dir
+            ("task-dir", Path("mistral.py"), "task-dir-mistral.py"),
+            ("workspace", Path("src/train.py"), "workspace-src-train.py"),
+            ("nemo-mistral", Path("config/model.yaml"), "nemo-mistral-config-model.yaml"),
+            # Cases without job_dir
+            ("", Path("mistral.py"), "mistral.py"),
+            (None, Path("train.py"), "train.py"),
+            # Cases with nested paths
+            ("task-dir", Path("src/models/mistral.py"), "task-dir-src-models-mistral.py"),
+            (
+                "workspace",
+                Path("configs/training/hyperparams.yaml"),
+                "workspace-configs-training-hyperparams.yaml",
+            ),
+            # Edge cases
+            ("", Path("file.with.dots.py"), "file.with.dots.py"),
+            ("task-dir", Path("file.with.dots.py"), "task-dir-file.with.dots.py"),
+            # Real-world examples
+            (
+                "mistral-training-task-dir",
+                Path("mistral.py"),
+                "mistral-training-task-dir-mistral.py",
+            ),
+            (
+                "nemo-mistral-workspace",
+                Path("src/training/script.py"),
+                "nemo-mistral-workspace-src-training-script.py",
+            ),
+        ],
+    )
+    def test_sanitize_configmap_key(self, job_dir, rel_path, expected_key):
+        """Test the _sanitize_configmap_key method with various inputs."""
+        packager = ConfigMapPackager()
+        result = packager._sanitize_configmap_key(job_dir, rel_path)
+        assert result == expected_key
+
+    @pytest.mark.parametrize(
+        "job_dir,rel_path,expected_key",
+        [
+            # Test that forward slashes are properly replaced with hyphens
+            ("task/dir", Path("mistral.py"), "task-dir-mistral.py"),
+            ("workspace/subdir", Path("src/train.py"), "workspace-subdir-src-train.py"),
+            (
+                "nemo/mistral/workspace",
+                Path("config/model.yaml"),
+                "nemo-mistral-workspace-config-model.yaml",
+            ),
+            # Test with multiple forward slashes
+            ("task/dir/subdir", Path("file.py"), "task-dir-subdir-file.py"),
+            ("", Path("src/models/mistral.py"), "src-models-mistral.py"),
+            # Test with mixed forward slashes and hyphens
+            ("task-dir/subdir", Path("file.py"), "task-dir-subdir-file.py"),
+            ("workspace/sub-dir", Path("src/train.py"), "workspace-sub-dir-src-train.py"),
+        ],
+    )
+    def test_sanitize_configmap_key_forward_slash_replacement(
+        self, job_dir, rel_path, expected_key
+    ):
+        """Test that forward slashes are properly replaced with hyphens in ConfigMap keys."""
+        packager = ConfigMapPackager()
+        result = packager._sanitize_configmap_key(job_dir, rel_path)
+        assert result == expected_key
+
+    def test_sanitize_configmap_key_with_none_job_dir(self):
+        """Test _sanitize_configmap_key with None job_dir."""
+        packager = ConfigMapPackager()
+        result = packager._sanitize_configmap_key(None, Path("mistral.py"))
+        assert result == "mistral.py"
+
+    def test_sanitize_configmap_key_with_empty_string_job_dir(self):
+        """Test _sanitize_configmap_key with empty string job_dir."""
+        packager = ConfigMapPackager()
+        result = packager._sanitize_configmap_key("", Path("mistral.py"))
+        assert result == "mistral.py"
+
+    def test_sanitize_configmap_key_with_complex_paths(self):
+        """Test _sanitize_configmap_key with complex nested paths."""
+        packager = ConfigMapPackager()
+
+        # Test deeply nested paths
+        result = packager._sanitize_configmap_key(
+            "nemo/mistral/workspace/training", Path("src/models/transformers/mistral/config.py")
+        )
+        expected = "nemo-mistral-workspace-training-src-models-transformers-mistral-config.py"
+        assert result == expected
+
+    def test_find_files_to_package_with_multiple_patterns(self):
+        """Test _find_files_to_package with multiple include patterns."""
+        packager = ConfigMapPackager(
+            include_pattern=["*.py", "*.yaml"], relative_path=["src", "config"]
+        )
+
+        # Create test directory structure
+        with (
+            patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.rglob") as mock_rglob,
+            patch("pathlib.Path.is_file", return_value=True),
+        ):
+            # Mock files found by rglob
+            mock_files = [
+                Path("/tmp/src/train.py"),
+                Path("/tmp/src/model.py"),
+                Path("/tmp/config/hyperparams.yaml"),
+                Path("/tmp/config/config.yaml"),
+            ]
+            mock_rglob.return_value = mock_files
+
+            result = packager._find_files_to_package(Path("/tmp"))
+
+            # Should find all files from both patterns
+            assert len(result) == 4
+            assert all(file in result for file in mock_files)
+
+    def test_find_files_to_package_with_nonexistent_paths(self):
+        """Test _find_files_to_package when search paths don't exist."""
+        packager = ConfigMapPackager(include_pattern=["*.py"], relative_path=["nonexistent"])
+
+        with patch("pathlib.Path.exists", return_value=False):
+            result = packager._find_files_to_package(Path("/tmp"))
+
+            # Should return empty list when paths don't exist
+            assert result == []
+
+    def test_package_with_file_reading_exception(self):
+        """Test package method when file reading fails."""
+        tmp_path = Path("/tmp")
+        mock_v1 = MagicMock()
+
+        with (
+            patch(
+                "nemo_run.core.packaging.configmap.ConfigMapPackager.__post_init__",
+                lambda self: setattr(self, "v1", mock_v1),
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.rglob", return_value=[Path("/tmp/test.py")]),
+            patch("pathlib.Path.is_file", return_value=True),
+            patch("pathlib.Path.stat") as mock_stat,
+            patch("builtins.open", side_effect=PermissionError("Permission denied")),
+        ):
+            mock_stat.return_value.st_size = 100
+            packager = ConfigMapPackager()
+            configmap_name = packager.package(tmp_path, "task-dir", "testjob")
+
+            # Should return configmap name but not create it due to file reading error
+            assert configmap_name == "nemo-workspace-testjob"
+            assert not mock_v1.create_namespaced_config_map.called
+
+    def test_package_with_configmap_already_exists(self):
+        """Test package method when ConfigMap already exists (409 conflict)."""
+        tmp_path = Path("/tmp")
+        mock_v1 = MagicMock()
+
+        # Mock ApiException for 409 conflict
+        from kubernetes.client.exceptions import ApiException
+
+        mock_v1.create_namespaced_config_map.side_effect = ApiException(status=409)
+
+        with (
+            patch(
+                "nemo_run.core.packaging.configmap.ConfigMapPackager.__post_init__",
+                lambda self: setattr(self, "v1", mock_v1),
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.rglob", return_value=[Path("/tmp/test.py")]),
+            patch("pathlib.Path.is_file", return_value=True),
+            patch("pathlib.Path.stat") as mock_stat,
+            patch("builtins.open", create=True) as mock_open,
+        ):
+            mock_stat.return_value.st_size = 100
+            mock_open.return_value.__enter__.return_value.read.return_value = "print('hello')"
+
+            packager = ConfigMapPackager()
+            configmap_name = packager.package(tmp_path, "task-dir", "testjob")
+
+            # Should return configmap name even when it already exists
+            assert configmap_name == "nemo-workspace-testjob"
+            mock_v1.create_namespaced_config_map.assert_called_once()
+
+    def test_package_with_other_api_exception(self):
+        """Test package method when ConfigMap creation fails with other error."""
+        tmp_path = Path("/tmp")
+        mock_v1 = MagicMock()
+
+        # Mock ApiException for other error
+        from kubernetes.client.exceptions import ApiException
+
+        mock_v1.create_namespaced_config_map.side_effect = ApiException(status=500)
+
+        with (
+            patch(
+                "nemo_run.core.packaging.configmap.ConfigMapPackager.__post_init__",
+                lambda self: setattr(self, "v1", mock_v1),
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.rglob", return_value=[Path("/tmp/test.py")]),
+            patch("pathlib.Path.is_file", return_value=True),
+            patch("pathlib.Path.stat") as mock_stat,
+            patch("builtins.open", create=True) as mock_open,
+        ):
+            mock_stat.return_value.st_size = 100
+            mock_open.return_value.__enter__.return_value.read.return_value = "print('hello')"
+
+            packager = ConfigMapPackager()
+            configmap_name = packager.package(tmp_path, "task-dir", "testjob")
+
+            # Should return configmap name even when creation fails
+            assert configmap_name == "nemo-workspace-testjob"
+            mock_v1.create_namespaced_config_map.assert_called_once()
+
+    def test_cleanup_with_configmap_not_found(self):
+        """Test cleanup when ConfigMap doesn't exist (404 error)."""
+        mock_v1 = MagicMock()
+
+        # Mock ApiException for 404 not found
+        from kubernetes.client.exceptions import ApiException
+
+        mock_v1.delete_namespaced_config_map.side_effect = ApiException(status=404)
+
+        with patch(
+            "nemo_run.core.packaging.configmap.ConfigMapPackager.__post_init__",
+            lambda self: setattr(self, "v1", mock_v1),
+        ):
+            packager = ConfigMapPackager()
+            # Should not raise exception when ConfigMap doesn't exist
+            packager.cleanup("testjob")
+            mock_v1.delete_namespaced_config_map.assert_called_once()
+
+    def test_cleanup_with_other_api_exception(self):
+        """Test cleanup when ConfigMap deletion fails with other error."""
+        mock_v1 = MagicMock()
+
+        # Mock ApiException for other error
+        from kubernetes.client.exceptions import ApiException
+
+        mock_v1.delete_namespaced_config_map.side_effect = ApiException(status=500)
+
+        with patch(
+            "nemo_run.core.packaging.configmap.ConfigMapPackager.__post_init__",
+            lambda self: setattr(self, "v1", mock_v1),
+        ):
+            packager = ConfigMapPackager()
+            # Should not raise exception when deletion fails
+            packager.cleanup("testjob")
+            mock_v1.delete_namespaced_config_map.assert_called_once()
 
 
 @pytest.fixture
@@ -24,7 +315,7 @@ def temp_py_files(tmp_path):
 @pytest.mark.parametrize(
     "job_dir,expected_prefix",
     [
-        ("test-job", "test-job/"),
+        ("test-job", "test-job"),
         ("", ""),
     ],
 )
@@ -49,7 +340,7 @@ def test_package_creates_configmap_with_job_dir(temp_py_files, job_dir, expected
         data = kwargs["body"].data
         for file_path in files:
             rel_path = file_path.relative_to(tmp_path)
-            configmap_key = f"{expected_prefix}{rel_path}" if expected_prefix else str(rel_path)
+            configmap_key = packager._sanitize_configmap_key(expected_prefix, rel_path)
             assert configmap_key in data
             assert data[configmap_key] == file_path.read_text()
 
