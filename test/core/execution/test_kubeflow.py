@@ -17,47 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_run.core.execution.kubeflow import KubeflowExecutor, sanitize_kubernetes_name
+from nemo_run.core.execution.kubeflow import KubeflowExecutor
 from nemo_run.core.packaging.configmap import ConfigMapPackager
-
-
-class TestSanitizeKubernetesName:
-    """Test cases for the sanitize_kubernetes_name function."""
-
-    @pytest.mark.parametrize(
-        "input_name,expected_output",
-        [
-            # Basic sanitization
-            ("test_name", "test-name"),
-            ("my_experiment_id", "my-experiment-id"),
-            ("task_dir", "task-dir"),
-            # No underscores - should remain unchanged
-            ("test-name", "test-name"),
-            ("experiment", "experiment"),
-            ("taskdir", "taskdir"),
-            # Multiple consecutive underscores
-            ("test__name", "test--name"),
-            ("my___experiment", "my---experiment"),
-            # Underscores at the beginning and end
-            ("_test_name_", "-test-name-"),
-            ("_experiment", "-experiment"),
-            ("experiment_", "experiment-"),
-            # Edge cases
-            ("", ""),
-            ("_", "-"),
-            # Mixed characters including underscores
-            ("test_123_name", "test-123-name"),
-            ("my-experiment_123", "my-experiment-123"),
-            ("mistral_training_task_dir", "mistral-training-task-dir"),
-            # Real-world examples
-            ("mistral_training", "mistral-training"),
-            ("nemo_mistral_workspace", "nemo-mistral-workspace"),
-            ("task_dir", "task-dir"),
-        ],
-    )
-    def test_sanitize_kubernetes_name(self, input_name, expected_output):
-        """Test the sanitize_kubernetes_name function with various inputs."""
-        assert sanitize_kubernetes_name(input_name) == expected_output
 
 
 def test_kubeflow_executor_default_init():
@@ -68,9 +29,11 @@ def test_kubeflow_executor_default_init():
     assert executor.ntasks_per_node == 1
     assert executor.namespace == "default"
     assert executor.python_file is None
-    assert executor.gpus == 1
+    assert executor.gpus is None
     assert executor.runtime_name == "torch-distributed-nemo"
     assert executor.job_name == ""
+    assert executor.default_task_dir == "task-dir"
+    assert executor.volume_mount_path == "/workspace"
     assert isinstance(executor.packager, ConfigMapPackager)
 
 
@@ -83,6 +46,8 @@ def test_kubeflow_executor_custom_init():
         python_file="train.py",
         gpus=8,
         runtime_name="custom-runtime",
+        default_task_dir="custom-task",
+        volume_mount_path="/custom/workspace",
     )
 
     assert executor.nodes == 2
@@ -91,6 +56,8 @@ def test_kubeflow_executor_custom_init():
     assert executor.python_file == "train.py"
     assert executor.gpus == 8
     assert executor.runtime_name == "custom-runtime"
+    assert executor.default_task_dir == "custom-task"
+    assert executor.volume_mount_path == "/custom/workspace"
 
 
 def test_kubeflow_executor_assign():
@@ -136,17 +103,45 @@ def test_kubeflow_executor_get_runtime():
         assert "trainer" in call_args[1]
 
 
-def test_kubeflow_executor_get_custom_trainer_file_based():
+@pytest.mark.parametrize(
+    "executor_kwargs,expected_python_file,expected_func,expected_nodes,test_description",
+    [
+        # File-based execution tests
+        (
+            {
+                "python_file": "train.py",
+                "nodes": 2,
+                "gpus": 8,
+                "cpu_request": "8",
+                "cpu_limit": "16",
+                "memory_request": "16Gi",
+                "memory_limit": "32Gi",
+            },
+            "/workspace/task-dir-train.py",
+            None,
+            2,
+            "file-based execution with default config",
+        ),
+        (
+            {
+                "python_file": "model.py",
+                "nodes": 1,
+                "gpus": 4,
+                "default_task_dir": "custom-task",
+                "volume_mount_path": "/custom/workspace",
+            },
+            "/custom/workspace/custom-task-model.py",
+            None,
+            1,
+            "file-based execution with custom config",
+        ),
+    ],
+)
+def test_kubeflow_executor_get_custom_trainer_file_based(
+    executor_kwargs, expected_python_file, expected_func, expected_nodes, test_description
+):
     """Test that _get_custom_trainer returns correct configuration for file-based execution."""
-    executor = KubeflowExecutor(
-        python_file="train.py",
-        nodes=2,
-        gpus=8,
-        cpu_request="8",
-        cpu_limit="16",
-        memory_request="16Gi",
-        memory_limit="32Gi",
-    )
+    executor = KubeflowExecutor(**executor_kwargs)
 
     with patch("nemo_run.core.execution.kubeflow.CustomTrainer") as mock_custom_trainer:
         mock_trainer = MagicMock()
@@ -157,9 +152,12 @@ def test_kubeflow_executor_get_custom_trainer_file_based():
         # Verify CustomTrainer was called with correct arguments
         mock_custom_trainer.assert_called_once()
         call_args = mock_custom_trainer.call_args[1]
-        assert call_args["python_file"] == "train.py"
-        assert "func" not in call_args
-        assert call_args["num_nodes"] == 2
+        assert call_args["python_file"] == expected_python_file
+        if expected_func is None:
+            assert "func" not in call_args
+        else:
+            assert call_args["func"] == expected_func
+        assert call_args["num_nodes"] == expected_nodes
         assert call_args["resources_per_node"] is not None
 
 
@@ -204,7 +202,7 @@ def test_kubeflow_executor_create_trainjob():
 
             assert job_id == "job-123"
             mock_client.train.assert_called_once()
-            mock_stage.assert_called_once_with("task_dir")
+            mock_stage.assert_called_once_with(executor.default_task_dir)
 
 
 def test_kubeflow_executor_get_trainjob_status():
@@ -273,7 +271,6 @@ def test_kubeflow_executor_get_sanitized_configmap_name():
 
     result = executor._get_sanitized_configmap_name("task_dir")
 
-    # Should sanitize both experiment_id and task_dir
     assert result == "mistral-training-task-dir"
 
 
@@ -284,7 +281,6 @@ def test_kubeflow_executor_get_sanitized_configmap_name_with_none_experiment_id(
 
     result = executor._get_sanitized_configmap_name("task_dir")
 
-    # Should use "experiment" as fallback
     assert result == "experiment-task-dir"
 
 
@@ -384,22 +380,38 @@ def test_kubeflow_executor_info(executor_kwargs, expected_mode, expected_nodes, 
     assert expected_info in info
 
 
-def test_kubeflow_executor_stage_files():
+@pytest.mark.parametrize(
+    "executor_kwargs,task_dir,expected_job_dir,expected_name,test_description",
+    [
+        # Default configuration tests
+        ({}, "task_dir", "task_dir", "exp-123-task-dir", "default configuration"),
+        (
+            {"default_task_dir": "custom-task"},
+            "custom-task",  # Use the configurable default
+            "custom-task",
+            "exp-123-custom-task",
+            "custom default task directory",
+        ),
+    ],
+)
+def test_kubeflow_executor_stage_files(
+    executor_kwargs, task_dir, expected_job_dir, expected_name, test_description
+):
     """Test that stage_files uses ConfigMapPackager correctly."""
-    executor = KubeflowExecutor()
+    executor = KubeflowExecutor(**executor_kwargs)
     executor.experiment_id = "exp-123"
     executor.experiment_dir = "/tmp/exp"
 
     with patch.object(executor.packager, "package") as mock_package:
         mock_package.return_value = "configmap-name"
 
-        result = executor.stage_files("task_dir")
+        result = executor.stage_files(task_dir)
 
         # Verify the package method was called with correct arguments
         mock_package.assert_called_once()
         call_args = mock_package.call_args
-        assert call_args[1]["job_dir"] == "task-dir"
-        assert call_args[1]["name"] == "exp-123-task-dir"
+        assert call_args[1]["job_dir"] == expected_job_dir
+        assert call_args[1]["name"] == expected_name
         assert result == "configmap-name"
 
 
@@ -412,3 +424,71 @@ def test_kubeflow_executor_cleanup_files():
         executor.cleanup_files("task_dir")
 
         mock_cleanup.assert_called_once_with("exp-123-task-dir")
+
+
+@pytest.mark.parametrize(
+    "executor_kwargs,job_dir,filename,expected_path,test_description",
+    [
+        # Default configuration tests
+        (
+            {"python_file": "mistral.py", "packager": ConfigMapPackager()},
+            None,
+            "mistral.py",
+            "/workspace/task-dir-mistral.py",
+            "default configuration",
+        ),
+        (
+            {"python_file": "train.py", "packager": ConfigMapPackager()},
+            "/tmp/experiment/custom-task",
+            "train.py",
+            "/workspace/custom-task-train.py",
+            "with job_dir set",
+        ),
+        # Custom volume mount tests
+        (
+            {
+                "python_file": "train.py",
+                "volume_mount_path": "/custom/workspace",
+                "packager": ConfigMapPackager(),
+            },
+            None,
+            "train.py",
+            "/custom/workspace/task-dir-train.py",
+            "custom volume mount path",
+        ),
+        # Sanitization tests
+        (
+            {"python_file": "train.py", "packager": ConfigMapPackager()},
+            "/tmp/experiment/task_dir",  # Contains underscore
+            "train.py",
+            "/workspace/task-dir-train.py",  # Underscore should be converted to hyphen
+            "job_dir with sanitization",
+        ),
+    ],
+)
+def test_kubeflow_executor_get_staged_file_path_configmap_packager(
+    executor_kwargs, job_dir, filename, expected_path, test_description
+):
+    """Test _get_staged_file_path with various ConfigMapPackager configurations."""
+    executor = KubeflowExecutor(**executor_kwargs)
+
+    if job_dir:
+        executor.job_dir = job_dir
+
+    result = executor._get_staged_file_path(filename)
+    assert result == expected_path, f"Failed for {test_description}"
+
+
+def test_kubeflow_executor_get_staged_file_path_non_configmap_packager():
+    """Test _get_staged_file_path with non-ConfigMapPackager."""
+
+    # Test the logic directly by mocking the isinstance check
+    executor = KubeflowExecutor(python_file="script.py")
+
+    # Mock the isinstance check to return False (simulating non-ConfigMapPackager)
+    with patch("nemo_run.core.execution.kubeflow.isinstance") as mock_isinstance:
+        mock_isinstance.return_value = False
+
+        result = executor._get_staged_file_path("script.py")
+        # Should return filename as-is for non-ConfigMapPackager
+        assert result == "script.py"

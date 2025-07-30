@@ -19,12 +19,13 @@ from pathlib import Path
 from typing import List, Optional
 
 from kubernetes import client, config
-from kubernetes.client.exceptions import ApiException
+from kubernetes.client.rest import ApiException
 from kubernetes.config.config_exception import ConfigException
 
-from nemo_run.core.packaging.base import Packager
+from nemo_run.core.packaging.base import Packager, sanitize_kubernetes_name
 
 logger = logging.getLogger(__name__)
+
 
 # Kubernetes ConfigMap has 1MB limit per key, but we'll use a conservative limit
 MAX_CONFIGMAP_SIZE = 1024 * 1024  # 1MB
@@ -42,20 +43,42 @@ class ConfigMapPackager(Packager):
     configmap_prefix: str = "nemo-workspace"
 
     def __post_init__(self):
-        """
-        Initialize the Kubernetes client.
-        """
+        """Initialize the Kubernetes client."""
         try:
-            try:
-                config.load_incluster_config()
-                logger.info("Loaded in-cluster Kubernetes config")
-            except ConfigException:
-                config.load_kube_config()
-                logger.info("Loaded kubeconfig from default location")
+            config.load_incluster_config()
             self.v1 = client.CoreV1Api()
-        except Exception as e:
-            logger.warning(f"Failed to initialize Kubernetes client: {e}")
-            self.v1 = None
+        except ConfigException:
+            try:
+                config.load_kube_config()
+                self.v1 = client.CoreV1Api()
+            except ConfigException:
+                logger.warning(
+                    "Could not load Kubernetes config, ConfigMap creation will be skipped"
+                )
+                self.v1 = None
+
+    def get_container_file_path(
+        self, job_dir: str, filename: str, volume_mount_path: str = "/workspace"
+    ) -> str:
+        """
+        Get the container file path for a given job_dir and filename.
+
+        This method returns the full path where a file would be accessible
+        after being packaged in a ConfigMap and mounted in a container.
+
+        Args:
+            job_dir: Directory prefix for organizing files within the ConfigMap
+            filename: The filename to get the path for
+            volume_mount_path: The volume mount path in the container
+
+        Returns:
+            The full path where the file would be accessible in the container
+        """
+        from pathlib import Path
+
+        rel_path = Path(filename)
+        configmap_key = self._sanitize_configmap_key(job_dir, rel_path)
+        return f"{volume_mount_path}/{configmap_key}"
 
     def _sanitize_configmap_key(self, job_dir: Optional[str], rel_path: Path) -> str:
         """
@@ -74,8 +97,9 @@ class ConfigMapPackager(Packager):
         """
         # Use job_dir as prefix to organize files within the ConfigMap
         configmap_key = f"{job_dir}/{rel_path}" if job_dir else str(rel_path)
-        # Replace forward slashes with hyphens to comply with Kubernetes ConfigMap key rules
-        return configmap_key.replace("/", "-")
+        # Replace forward slashes with hyphens and sanitize for Kubernetes naming
+        sanitized_key = configmap_key.replace("/", "-")
+        return sanitize_kubernetes_name(sanitized_key)
 
     def package(self, path: Path, job_dir: str, name: str) -> str:
         """

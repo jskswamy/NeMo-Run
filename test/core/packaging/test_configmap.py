@@ -18,7 +18,47 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from nemo_run.core.packaging.base import sanitize_kubernetes_name
 from nemo_run.core.packaging.configmap import ConfigMapPackager
+
+
+class TestSanitizeKubernetesName:
+    """Test cases for the sanitize_kubernetes_name function."""
+
+    @pytest.mark.parametrize(
+        "input_name,expected_output",
+        [
+            # Basic sanitization
+            ("test_name", "test-name"),
+            ("my_experiment_id", "my-experiment-id"),
+            ("task_dir", "task-dir"),
+            # No underscores - should remain unchanged
+            ("test-name", "test-name"),
+            ("experiment", "experiment"),
+            ("taskdir", "taskdir"),
+            # Multiple consecutive underscores
+            ("test__name", "test--name"),
+            ("my___experiment", "my---experiment"),
+            # Underscores at the beginning and end
+            ("_test_name_", "-test-name-"),
+            ("_experiment", "-experiment"),
+            ("experiment_", "experiment-"),
+            # Edge cases
+            ("", ""),
+            ("_", "-"),
+            # Mixed characters including underscores
+            ("test_123_name", "test-123-name"),
+            ("my-experiment_123", "my-experiment-123"),
+            ("mistral_training_task_dir", "mistral-training-task-dir"),
+            # Real-world examples
+            ("mistral_training", "mistral-training"),
+            ("nemo_mistral_workspace", "nemo-mistral-workspace"),
+            ("task_dir", "task-dir"),
+        ],
+    )
+    def test_sanitize_kubernetes_name(self, input_name, expected_output):
+        """Test the sanitize_kubernetes_name function with various inputs."""
+        assert sanitize_kubernetes_name(input_name) == expected_output
 
 
 class TestConfigMapPackager:
