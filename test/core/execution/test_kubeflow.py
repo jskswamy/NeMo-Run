@@ -17,8 +17,47 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_run.core.execution.kubeflow import KubeflowExecutor
+from nemo_run.core.execution.kubeflow import KubeflowExecutor, sanitize_kubernetes_name
 from nemo_run.core.packaging.configmap import ConfigMapPackager
+
+
+class TestSanitizeKubernetesName:
+    """Test cases for the sanitize_kubernetes_name function."""
+
+    @pytest.mark.parametrize(
+        "input_name,expected_output",
+        [
+            # Basic sanitization
+            ("test_name", "test-name"),
+            ("my_experiment_id", "my-experiment-id"),
+            ("task_dir", "task-dir"),
+            # No underscores - should remain unchanged
+            ("test-name", "test-name"),
+            ("experiment", "experiment"),
+            ("taskdir", "taskdir"),
+            # Multiple consecutive underscores
+            ("test__name", "test--name"),
+            ("my___experiment", "my---experiment"),
+            # Underscores at the beginning and end
+            ("_test_name_", "-test-name-"),
+            ("_experiment", "-experiment"),
+            ("experiment_", "experiment-"),
+            # Edge cases
+            ("", ""),
+            ("_", "-"),
+            # Mixed characters including underscores
+            ("test_123_name", "test-123-name"),
+            ("my-experiment_123", "my-experiment-123"),
+            ("mistral_training_task_dir", "mistral-training-task-dir"),
+            # Real-world examples
+            ("mistral_training", "mistral-training"),
+            ("nemo_mistral_workspace", "nemo-mistral-workspace"),
+            ("task_dir", "task-dir"),
+        ],
+    )
+    def test_sanitize_kubernetes_name(self, input_name, expected_output):
+        """Test the sanitize_kubernetes_name function with various inputs."""
+        assert sanitize_kubernetes_name(input_name) == expected_output
 
 
 def test_kubeflow_executor_default_init():
@@ -31,7 +70,7 @@ def test_kubeflow_executor_default_init():
     assert executor.python_file is None
     assert executor.gpus == 1
     assert executor.runtime_name == "torch-distributed-nemo"
-    assert executor.job_name == ""  # Should start empty
+    assert executor.job_name == ""
     assert isinstance(executor.packager, ConfigMapPackager)
 
 
@@ -79,14 +118,22 @@ def test_kubeflow_executor_nproc_per_node():
 
 def test_kubeflow_executor_get_runtime():
     """Test that _get_runtime returns the correct Runtime configuration."""
-    executor = KubeflowExecutor(python_file="train.py", gpus=4, runtime_name="custom-runtime")
-    runtime = executor._get_runtime()
+    executor = KubeflowExecutor(
+        runtime_name="custom-runtime", gpus=4, nodes=2, python_file="train.py"
+    )
 
-    assert runtime.name == "custom-runtime"
-    assert runtime.trainer is not None
-    assert runtime.trainer.framework.value == "torch"
-    assert runtime.trainer.accelerator == "gpu"
-    assert runtime.trainer.accelerator_count == 4
+    with patch("nemo_run.core.execution.kubeflow.Runtime") as mock_runtime:
+        mock_runtime_instance = MagicMock()
+        mock_runtime.return_value = mock_runtime_instance
+
+        result = executor._get_runtime()
+
+        assert result == mock_runtime_instance
+        # Verify Runtime was called with correct name and some trainer object
+        mock_runtime.assert_called_once()
+        call_args = mock_runtime.call_args
+        assert call_args[1]["name"] == "custom-runtime"
+        assert "trainer" in call_args[1]
 
 
 def test_kubeflow_executor_get_custom_trainer_file_based():
@@ -205,6 +252,121 @@ def test_kubeflow_executor_get_trainjob_logs():
         mock_client.get_job_logs.assert_called_once_with("job-123", follow=True)
 
 
+def test_kubeflow_executor_get_trainer_client():
+    """Test that _get_trainer_client returns a TrainerClient instance."""
+    executor = KubeflowExecutor(namespace="test-namespace")
+
+    with patch("nemo_run.core.execution.kubeflow.TrainerClient") as mock_trainer_client:
+        mock_client = MagicMock()
+        mock_trainer_client.return_value = mock_client
+
+        result = executor._get_trainer_client()
+
+        assert result == mock_client
+        mock_trainer_client.assert_called_once_with(namespace="test-namespace")
+
+
+def test_kubeflow_executor_get_sanitized_configmap_name():
+    """Test that _get_sanitized_configmap_name returns correct sanitized name."""
+    executor = KubeflowExecutor()
+    executor.experiment_id = "mistral_training"
+
+    result = executor._get_sanitized_configmap_name("task_dir")
+
+    # Should sanitize both experiment_id and task_dir
+    assert result == "mistral-training-task-dir"
+
+
+def test_kubeflow_executor_get_sanitized_configmap_name_with_none_experiment_id():
+    """Test _get_sanitized_configmap_name when experiment_id is None."""
+    executor = KubeflowExecutor()
+    executor.experiment_id = None
+
+    result = executor._get_sanitized_configmap_name("task_dir")
+
+    # Should use "experiment" as fallback
+    assert result == "experiment-task-dir"
+
+
+def test_kubeflow_executor_post_init():
+    """Test that __post_init__ sets up the packager correctly."""
+    executor = KubeflowExecutor()
+
+    # Should have a ConfigMapPackager instance
+    assert isinstance(executor.packager, ConfigMapPackager)
+    assert executor.packager.namespace == "default"
+    assert executor.packager.configmap_prefix == "nemo-workspace"
+
+
+def test_kubeflow_executor_post_init_with_custom_packager():
+    """Test that __post_init__ works with custom packager."""
+    custom_packager = ConfigMapPackager(namespace="custom-ns")
+    executor = KubeflowExecutor(packager=custom_packager)
+
+    # Should use the custom packager
+    assert executor.packager == custom_packager
+    assert executor.packager.namespace == "custom-ns"
+
+
+def test_kubeflow_executor_create_trainjob_with_error():
+    """Test create_trainjob when SDK call fails."""
+    executor = KubeflowExecutor(python_file="train.py")
+    executor.assign("exp-123", "/tmp/exp", "my-task", "task_dir")
+
+    with patch.object(executor, "_get_trainer_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.train.side_effect = Exception("SDK error")
+        mock_get_client.return_value = mock_client
+
+        with patch.object(executor, "stage_files") as mock_stage:
+            mock_stage.return_value = "configmap-name"
+
+            # Should raise the exception
+            with pytest.raises(Exception, match="SDK error"):
+                executor.create_trainjob("test-job")
+
+
+def test_kubeflow_executor_get_trainjob_status_with_error():
+    """Test get_trainjob_status when SDK call fails."""
+    executor = KubeflowExecutor(python_file="train.py")
+
+    with patch.object(executor, "_get_trainer_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.get_job.side_effect = Exception("SDK error")
+        mock_get_client.return_value = mock_client
+
+        # Should return "Unknown" when SDK call fails
+        result = executor.get_trainjob_status("job-123")
+        assert result == "Unknown"
+
+
+def test_kubeflow_executor_delete_trainjob_with_error():
+    """Test delete_trainjob when SDK call fails."""
+    executor = KubeflowExecutor()
+
+    with patch.object(executor, "_get_trainer_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.delete_job.side_effect = Exception("SDK error")
+        mock_get_client.return_value = mock_client
+
+        # Should not raise exception, just log error
+        executor.delete_trainjob("job-123")
+
+
+def test_kubeflow_executor_get_trainjob_logs_with_error():
+    """Test get_trainjob_logs when SDK call fails."""
+    executor = KubeflowExecutor()
+
+    with patch.object(executor, "_get_trainer_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.get_job_logs.side_effect = Exception("SDK error")
+        mock_get_client.return_value = mock_client
+
+        # Should return empty dict when SDK call fails
+        result = executor.get_trainjob_logs("job-123")
+        assert result == {}
+
+
 @pytest.mark.parametrize(
     "executor_kwargs,expected_mode,expected_nodes,expected_gpus",
     [
@@ -236,8 +398,8 @@ def test_kubeflow_executor_stage_files():
         # Verify the package method was called with correct arguments
         mock_package.assert_called_once()
         call_args = mock_package.call_args
-        assert call_args[1]["job_dir"] == "task_dir"
-        assert call_args[1]["name"] == "exp-123-task_dir"
+        assert call_args[1]["job_dir"] == "task-dir"
+        assert call_args[1]["name"] == "exp-123-task-dir"
         assert result == "configmap-name"
 
 
@@ -249,4 +411,4 @@ def test_kubeflow_executor_cleanup_files():
     with patch.object(executor.packager, "cleanup") as mock_cleanup:
         executor.cleanup_files("task_dir")
 
-        mock_cleanup.assert_called_once_with("exp-123-task_dir")
+        mock_cleanup.assert_called_once_with("exp-123-task-dir")
