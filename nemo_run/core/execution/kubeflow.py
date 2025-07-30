@@ -23,25 +23,10 @@ from kubeflow.trainer.api.trainer_client import TrainerClient
 from kubeflow.trainer.types.types import CustomTrainer, Framework, Runtime, Trainer, TrainerType
 
 from nemo_run.core.execution.base import Executor
+from nemo_run.core.packaging.base import sanitize_kubernetes_name
 from nemo_run.core.packaging.configmap import ConfigMapPackager
 
 logger = logging.getLogger(__name__)
-
-
-def sanitize_kubernetes_name(name: str) -> str:
-    """
-    Sanitize a string to be used as a Kubernetes resource name.
-
-    Replaces underscores with hyphens to comply with RFC 1123 subdomain rules.
-    This is a common pattern used across the codebase for Kubernetes resource naming.
-
-    Args:
-        name: The string to sanitize
-
-    Returns:
-        A sanitized string suitable for use as a Kubernetes resource name
-    """
-    return name.replace("_", "-")
 
 
 @dataclass(kw_only=True)
@@ -104,23 +89,29 @@ class KubeflowExecutor(Executor):
     #: Function to execute (for function-based execution)
     func: Optional[Callable] = None
 
-    #: Resource requests for CPU
-    cpu_request: str = "4"
+    #: Resource requests for CPU (optional - defaults to ClusterTrainingRuntime)
+    cpu_request: Optional[str] = None
 
-    #: Resource limits for CPU
-    cpu_limit: str = "8"
+    #: Resource limits for CPU (optional - defaults to ClusterTrainingRuntime)
+    cpu_limit: Optional[str] = None
 
-    #: Resource requests for memory
-    memory_request: str = "8Gi"
+    #: Resource requests for memory (optional - defaults to ClusterTrainingRuntime)
+    memory_request: Optional[str] = None
 
-    #: Resource limits for memory
-    memory_limit: str = "16Gi"
+    #: Resource limits for memory (optional - defaults to ClusterTrainingRuntime)
+    memory_limit: Optional[str] = None
 
-    #: Number of GPUs to request
-    gpus: int = 1
+    #: Number of GPUs to request (optional - defaults to ClusterTrainingRuntime)
+    gpus: Optional[int] = None
 
     #: Name of the ClusterTrainingRuntime to use
     runtime_name: str = "torch-distributed-nemo"
+
+    #: Volume mount path for staged files (default: /workspace)
+    volume_mount_path: str = "/workspace"
+
+    #: Default task directory name (default: "task-dir")
+    default_task_dir: str = "task-dir"
 
     #: TrainerClient instance for managing TrainJob objects
     _trainer_client: Optional[TrainerClient] = None
@@ -172,32 +163,77 @@ class KubeflowExecutor(Executor):
             trainer_type=TrainerType.CUSTOM_TRAINER,
             framework=Framework.TORCH,
             # Let the ClusterTrainingRuntime determine the entrypoint
-            accelerator="gpu" if self.gpus > 0 else "cpu",
-            accelerator_count=self.gpus,
+            accelerator="gpu" if self.gpus and self.gpus > 0 else "cpu",
+            accelerator_count=self.gpus or 0,
         )
 
         return Runtime(name=self.runtime_name, trainer=trainer)
 
     def _get_custom_trainer(self) -> CustomTrainer:
         """Get the CustomTrainer configuration for the training job."""
-        # Create a flat resources dictionary as expected by the Kubeflow SDK
-        resources_per_node = {
-            "cpu": self.cpu_limit,
-            "memory": self.memory_limit,
-            "nvidia.com/gpu": str(self.gpus),
-        }
-
         # Create CustomTrainer with either python_file or func
-        trainer_kwargs = {"num_nodes": self.nodes, "resources_per_node": resources_per_node}
+        trainer_kwargs: dict = {"num_nodes": self.nodes}
+
+        # Set resources - explicitly empty if not specified to override SDK defaults
+        resources_per_node: dict = {}
+        if self.cpu_limit is not None:
+            resources_per_node["cpu"] = self.cpu_limit
+        if self.memory_limit is not None:
+            resources_per_node["memory"] = self.memory_limit
+        if self.gpus is not None:
+            resources_per_node["nvidia.com/gpu"] = str(self.gpus)
+
+        # Always set resources_per_node to override SDK defaults
+        # If empty, it will result in no resource limits
+        trainer_kwargs["resources_per_node"] = resources_per_node
 
         if self.python_file:
-            trainer_kwargs["python_file"] = self.python_file
+            # Infer the correct path to the staged file
+            python_file_path = self._get_staged_file_path(self.python_file)
+            logger.info(f"📁 Staged file path: {python_file_path}")
+            trainer_kwargs["python_file"] = python_file_path
         elif self.func:
             trainer_kwargs["func"] = self.func
         else:
             raise ValueError("Either python_file or func must be specified")
 
         return CustomTrainer(**trainer_kwargs)
+
+    def _get_staged_file_path(self, filename: str) -> str:
+        """
+        Infer the correct path to a staged file based on how it was staged.
+
+        This method determines the full path to a staged file by:
+        1. Getting the expected file path from the ConfigMapPackager
+        2. Using the volume mount path from the ClusterTrainingRuntime
+
+        Args:
+            filename: The filename to resolve (e.g., "mistral.py")
+
+        Returns:
+            The full path to the staged file in the container
+        """
+        # Get the task directory from job_dir if available
+        task_dir = self.default_task_dir  # Use the configurable default
+        if hasattr(self, "job_dir") and self.job_dir:
+            task_dir = os.path.basename(self.job_dir)
+
+        # Determine the file path based on the packager
+        if isinstance(self.packager, ConfigMapPackager):
+            # Get the expected file path from the ConfigMapPackager
+            full_path = self.packager.get_container_file_path(
+                task_dir, filename, self.volume_mount_path
+            )
+
+            logger.debug(f"📝 Task dir: {task_dir}")
+            logger.debug(f"📁 Volume mount path: {self.volume_mount_path}")
+            logger.debug(f"🔗 Full path: {full_path}")
+
+            return full_path
+        else:
+            # For non-ConfigMapPackager, assume the file is in the working directory
+            logger.warning("Non-ConfigMapPackager used, assuming file is in working directory")
+            return filename
 
     def create_trainjob(self, job_name: str) -> str:
         """Create a TrainJob using the Kubeflow SDK."""
@@ -208,7 +244,7 @@ class KubeflowExecutor(Executor):
 
             # Stage files if using ConfigMapPackager
             if isinstance(self.packager, ConfigMapPackager):
-                configmap_name = self.stage_files("task_dir")
+                configmap_name = self.stage_files(self.default_task_dir)
                 logger.info(f"Staged files in ConfigMap: {configmap_name}")
 
             # TODO: Use job_name once Kubeflow SDK supports custom job names
@@ -255,6 +291,8 @@ class KubeflowExecutor(Executor):
         """Get a sanitized ConfigMap name that complies with Kubernetes naming rules."""
         sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
         sanitized_task_dir = sanitize_kubernetes_name(task_dir)
+
+        # Always return just the experiment and task parts - let ConfigMapPackager add workspace prefix
         configmap_name = f"{sanitized_experiment_id}-{sanitized_task_dir}"
         logger.debug(f"Original experiment_id: {self.experiment_id}, task_dir: {task_dir}")
         logger.debug(f"Sanitized ConfigMap name: {configmap_name}")
@@ -264,11 +302,9 @@ class KubeflowExecutor(Executor):
         """Stage files using the ConfigMapPackager."""
         if isinstance(self.packager, ConfigMapPackager):
             configmap_name = self._get_sanitized_configmap_name(task_dir)
-            # Also sanitize the job_dir parameter to ensure ConfigMap keys are valid
-            sanitized_task_dir = sanitize_kubernetes_name(task_dir)
             return self.packager.package(
                 path=Path(self.experiment_dir),
-                job_dir=sanitized_task_dir,
+                job_dir=task_dir,
                 name=configmap_name,
             )
         else:
