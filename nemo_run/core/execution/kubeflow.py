@@ -17,11 +17,12 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional, Union
 
 from kubeflow.trainer.api.trainer_client import TrainerClient
-from kubeflow.trainer.types.types import CustomTrainer, Framework, Runtime, Trainer, TrainerType
+from kubeflow.trainer.types.types import CustomTrainer, Runtime
 
+from nemo_run.config import Partial, Script
 from nemo_run.core.execution.base import Executor
 from nemo_run.core.packaging.base import sanitize_kubernetes_name
 from nemo_run.core.packaging.configmap import ConfigMapPackager
@@ -35,9 +36,7 @@ class KubeflowExecutor(Executor):
     Dataclass to configure Kubeflow executor for distributed training jobs.
 
     This executor uses the Kubeflow Trainer SDK to create and manage TrainJob objects.
-    It supports both file-based and function-based execution modes.
-    For file-based execution, it stages files into Kubernetes ConfigMaps.
-    For function-based execution, it serializes functions and stages them as well.
+    It supports execution of tasks passed from the Experiment API (Script, Partial, Config).
 
     The actual execution details (torchrun vs python, command construction) are handled
     by the Kubeflow SDK through the Runtime and Trainer objects.
@@ -46,32 +45,18 @@ class KubeflowExecutor(Executor):
 
     .. code-block:: python
 
-        # File-based execution
+        # Configure executor for execution environment
         executor = KubeflowExecutor(
-            packager=ConfigMapPackager(include_pattern="*.py"),
-            python_file="train.py",
-            namespace="default"
-        )
-
-        # Or use function-based execution
-        def my_training_function():
-            import torch
-            print("Training with PyTorch...")
-            # Your training logic here
-
-        executor = KubeflowExecutor(
-            packager=ConfigMapPackager(include_pattern="*.py"),
-            func=my_training_function,
-            namespace="default"
-        )
-
-        # Example: specifying a custom ClusterTrainingRuntime by name
-        executor = KubeflowExecutor(
-            packager=ConfigMapPackager(include_pattern="*.py"),
-            python_file="train.py",
             namespace="default",
-            runtime_name="my-custom-clusterruntime"
+            runtime_name="torch-distributed-nemo"
         )
+
+        # Use with Experiment API
+        training_script = run.Script(inline="python train.py")
+
+        with run.Experiment("training") as exp:
+            exp.add(training_script, executor=executor)
+            exp.run()
     """
 
     #: Number of nodes for distributed training
@@ -82,12 +67,6 @@ class KubeflowExecutor(Executor):
 
     #: Kubernetes namespace for the training job
     namespace: str = "default"
-
-    #: Python file to execute (for file-based execution)
-    python_file: Optional[str] = None
-
-    #: Function to execute (for function-based execution)
-    func: Optional[Callable] = None
 
     #: Resource requests for CPU (optional - defaults to ClusterTrainingRuntime)
     cpu_request: Optional[str] = None
@@ -119,13 +98,15 @@ class KubeflowExecutor(Executor):
     #: Job name (set from task_id during assign)
     job_name: str = field(init=False, default="")
 
+    #: Current task being executed (set by Experiment API)
+    _current_task: Optional[Union[Script, Partial]] = None
+
     def __post_init__(self):
-        """Initialize the executor with ConfigMapPackager if not provided."""
-        if not isinstance(self.packager, ConfigMapPackager):
-            # Use ConfigMapPackager as default packager
-            self.packager = ConfigMapPackager(
-                include_pattern="*.py", relative_path=".", namespace=self.namespace
-            )
+        """Validate executor configuration."""
+        if self.nodes < 1:
+            raise ValueError("nodes must be >= 1")
+        if self.ntasks_per_node < 1:
+            raise ValueError("ntasks_per_node must be >= 1")
 
     def assign(
         self,
@@ -134,7 +115,7 @@ class KubeflowExecutor(Executor):
         task_id: str,
         task_dir: str,
     ):
-        """Assign experiment and task directories to the executor."""
+        """Assign experiment and task information to the executor."""
         self.experiment_id = exp_id
         self.experiment_dir = exp_dir
         self.job_dir = os.path.join(exp_dir, task_dir)
@@ -149,29 +130,20 @@ class KubeflowExecutor(Executor):
         return self.ntasks_per_node
 
     def _get_trainer_client(self) -> TrainerClient:
-        """Get or create the TrainerClient instance."""
+        """Get or create a TrainerClient instance."""
         if self._trainer_client is None:
-            self._trainer_client = TrainerClient(namespace=self.namespace)
+            self._trainer_client = TrainerClient()
         return self._trainer_client
 
     def _get_runtime(self) -> Runtime:
         """Get the Runtime configuration for the training job."""
-        # Create a basic runtime configuration
-        # The entrypoint will be determined by the ClusterTrainingRuntime
-        # We don't need to manually set it here
-        trainer = Trainer(
-            trainer_type=TrainerType.CUSTOM_TRAINER,
-            framework=Framework.TORCH,
-            # Let the ClusterTrainingRuntime determine the entrypoint
-            accelerator="gpu" if self.gpus and self.gpus > 0 else "cpu",
-            accelerator_count=self.gpus or 0,
+        return Runtime(
+            name=self.runtime_name,
         )
 
-        return Runtime(name=self.runtime_name, trainer=trainer)
-
-    def _get_custom_trainer(self) -> CustomTrainer:
+    def _get_custom_trainer(self, task) -> CustomTrainer:
         """Get the CustomTrainer configuration for the training job."""
-        # Create CustomTrainer with either python_file or func
+        # Create CustomTrainer with task from Experiment API
         trainer_kwargs: dict = {"num_nodes": self.nodes}
 
         # Set resources - explicitly empty if not specified to override SDK defaults
@@ -187,15 +159,13 @@ class KubeflowExecutor(Executor):
         # If empty, it will result in no resource limits
         trainer_kwargs["resources_per_node"] = resources_per_node
 
-        if self.python_file:
-            # Infer the correct path to the staged file
-            python_file_path = self._get_staged_file_path(self.python_file)
-            logger.info(f"📁 Staged file path: {python_file_path}")
-            trainer_kwargs["python_file"] = python_file_path
-        elif self.func:
-            trainer_kwargs["func"] = self.func
+        # Handle task from Experiment API
+        if hasattr(task, "inline") and task.inline:  # Script object
+            trainer_kwargs["python_file"] = task.inline
+        elif hasattr(task, "__fn_or_cls__"):  # Partial object
+            trainer_kwargs["func"] = task.__fn_or_cls__
         else:
-            raise ValueError("Either python_file or func must be specified")
+            raise ValueError("Task must be a Script or Partial object")
 
         return CustomTrainer(**trainer_kwargs)
 
@@ -235,12 +205,12 @@ class KubeflowExecutor(Executor):
             logger.warning("Non-ConfigMapPackager used, assuming file is in working directory")
             return filename
 
-    def create_trainjob(self, job_name: str) -> str:
+    def create_trainjob(self, job_name: str, task) -> str:
         """Create a TrainJob using the Kubeflow SDK."""
         try:
             client = self._get_trainer_client()
             runtime = self._get_runtime()
-            trainer = self._get_custom_trainer()
+            trainer = self._get_custom_trainer(task)
 
             # Stage files if using ConfigMapPackager
             if isinstance(self.packager, ConfigMapPackager):
@@ -292,32 +262,128 @@ class KubeflowExecutor(Executor):
         sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
         sanitized_task_dir = sanitize_kubernetes_name(task_dir)
 
-        # Always return just the experiment and task parts - let ConfigMapPackager add workspace prefix
-        configmap_name = f"{sanitized_experiment_id}-{sanitized_task_dir}"
-        logger.debug(f"Original experiment_id: {self.experiment_id}, task_dir: {task_dir}")
-        logger.debug(f"Sanitized ConfigMap name: {configmap_name}")
-        return configmap_name
+        # Use the packager's configmap_prefix if available
+        configmap_prefix = getattr(self.packager, "configmap_prefix", "nemo-workspace")
+        if configmap_prefix:
+            return f"{configmap_prefix}-{sanitized_experiment_id}-{sanitized_task_dir}"
+        else:
+            return f"{sanitized_experiment_id}-{sanitized_task_dir}"
 
     def stage_files(self, task_dir: str) -> str:
-        """Stage files using the ConfigMapPackager."""
-        if isinstance(self.packager, ConfigMapPackager):
+        """Stage files using the packager and return the ConfigMap name."""
+        try:
             configmap_name = self._get_sanitized_configmap_name(task_dir)
-            return self.packager.package(
-                path=Path(self.experiment_dir),
-                job_dir=task_dir,
-                name=configmap_name,
+            self.packager.package(
+                path=Path(self.experiment_dir), job_dir=task_dir, name=configmap_name
             )
-        else:
-            logger.warning("Non-ConfigMapPackager used, file staging may not work as expected")
-            return ""
+            logger.info(f"Staged files in ConfigMap: {configmap_name}")
+            return configmap_name
+        except Exception as e:
+            logger.error(f"Failed to stage files: {e}")
+            raise
 
     def cleanup_files(self, task_dir: str):
         """Clean up staged files."""
-        if isinstance(self.packager, ConfigMapPackager):
+        try:
             configmap_name = self._get_sanitized_configmap_name(task_dir)
-            self.packager.cleanup(configmap_name)
+            # TODO: Implement ConfigMap cleanup when Kubeflow SDK supports it
+            logger.info(f"Files staged in ConfigMap: {configmap_name}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup files: {e}")
+
+    def submit(self, task, job_name: str) -> str:
+        """
+        Submit a job using the Kubeflow SDK.
+
+        This method is called by the Experiment API to submit a task for execution.
+        It handles task validation, file staging, and TrainJob creation.
+
+        Args:
+            task: The task to execute (Script or Partial object)
+            job_name: The name of the job to submit
+
+        Returns:
+            The job ID returned by the Kubeflow SDK
+
+        Raises:
+            RuntimeError: If executor is not assigned to an experiment
+            ValueError: If task is not a valid Script or Partial object
+        """
+        if not hasattr(self, "experiment_id") or not self.experiment_id:
+            raise RuntimeError("Executor not assigned to experiment")
+
+        try:
+            # Stage files if using ConfigMapPackager
+            if isinstance(self.packager, ConfigMapPackager):
+                configmap_name = self.stage_files(self.job_dir.split("/")[-1])
+                logger.info(f"Staged files in ConfigMap: {configmap_name}")
+
+            # Create TrainJob using the Kubeflow SDK
+            job_id = self.create_trainjob(job_name, task)
+            logger.info(f"Submitted job {job_name} with ID: {job_id}")
+
+            return job_id
+
+        except Exception as e:
+            logger.error(f"Failed to submit job {job_name}: {e}")
+            raise
+
+    def monitor(self, job_id: str) -> str:
+        """
+        Monitor the status of a submitted job.
+
+        This method is called by the Experiment API to check job status.
+
+        Args:
+            job_id: The ID of the job to monitor
+
+        Returns:
+            The current status of the job (Running, Completed, Failed, etc.)
+
+        Raises:
+            RuntimeError: If executor is not assigned to an experiment
+        """
+        if not hasattr(self, "experiment_id") or not self.experiment_id:
+            raise RuntimeError("Executor not assigned to experiment")
+
+        try:
+            status = self.get_trainjob_status(job_id)
+            logger.debug(f"Job {job_id} status: {status}")
+            return status
+
+        except Exception as e:
+            logger.error(f"Failed to monitor job {job_id}: {e}")
+            return "Unknown"
+
+    def cleanup(self, handle: str) -> None:
+        """
+        Clean up resources associated with a job.
+
+        This method is called by the Experiment API to clean up job resources.
+        It handles TrainJob deletion and file cleanup.
+
+        Args:
+            handle: The ID of the job to clean up
+
+        Raises:
+            RuntimeError: If executor is not assigned to an experiment
+        """
+        if not hasattr(self, "experiment_id") or not self.experiment_id:
+            raise RuntimeError("Executor not assigned to experiment")
+
+        try:
+            # Delete the TrainJob
+            self.delete_trainjob(handle)
+
+            # Clean up staged files
+            task_dir = self.job_dir.split("/")[-1] if self.job_dir else self.default_task_dir
+            self.cleanup_files(task_dir)
+
+            logger.info(f"Cleaned up job {handle}")
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup job {handle}: {e}")
 
     def info(self) -> str:
-        """Return information about this executor."""
-        mode = "file-based" if self.python_file else "function-based"
-        return f"KubeflowExecutor({mode}, nodes={self.nodes}, gpus={self.gpus})"
+        """Get information about the executor configuration."""
+        return f"KubeflowExecutor (nodes={self.nodes}, gpus={self.gpus or 0})"
