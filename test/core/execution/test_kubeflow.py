@@ -105,9 +105,7 @@ def test_kubeflow_executor_get_runtime():
             {
                 "nodes": 2,
                 "gpus": 8,
-                "cpu_request": "8",
                 "cpu_limit": "16",
-                "memory_request": "16Gi",
                 "memory_limit": "32Gi",
             },
             "/workspace/task-dir-train.py",
@@ -1492,24 +1490,38 @@ def test_kubeflow_executor_configmap_lifecycle_management():
 
 def test_kubeflow_executor_cluster_training_runtime_creation():
     """Test ClusterTrainingRuntime creation with experiment-specific configurations."""
-    executor = KubeflowExecutor(
-        nodes=2, gpus=8, namespace="training", runtime_name="custom-runtime"
-    )
-    executor.assign("exp-123", "/tmp/exp", "task-1", "task-dir")
+    # Mock Kubernetes setup at initialization time
+    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
+        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+            with patch("kubernetes.client.CoreV1Api") as mock_core_api:
+                # Mock successful Kubernetes setup
+                mock_core_api_instance = mock_core_api.return_value
+                mock_core_api_instance.list_namespace.return_value = None
 
-    with patch.object(executor, "create_trainjob") as mock_create_trainjob:
-        mock_create_trainjob.return_value = "job-123"
+                executor = KubeflowExecutor(
+                    nodes=2, gpus=8, namespace="training", runtime_name="custom-runtime"
+                )
+                executor.assign("exp-123", "/tmp/exp", "task-1", "task-dir")
 
-        with patch.object(executor.packager, "package") as mock_package:
-            mock_package.return_value = "configmap-123"
+                # Test that ClusterTrainingRuntime creation is called during runtime setup
+                with patch.object(
+                    executor, "_create_cluster_training_runtime"
+                ) as mock_create_runtime:
+                    mock_create_runtime.return_value = "nemo-exp-123"
 
-            # Test ClusterTrainingRuntime creation during job submission
-            job_id = executor.submit(MagicMock(inline="print('hello')"), "test-job")
-            assert job_id == "job-123"
+                    runtime = executor._get_runtime()
+                    assert runtime.name == "nemo-exp-123"
+                    mock_create_runtime.assert_called_once()
 
-            # Verify that ClusterTrainingRuntime was created with experiment-specific config
-            # This would be verified by checking the runtime configuration passed to create_trainjob
-            mock_create_trainjob.assert_called_once()
+                # Test experiment-specific runtime name generation with real Kubernetes API calls
+                with patch("kubernetes.client.CustomObjectsApi") as mock_api:
+                    # Mock successful creation
+                    mock_api_instance = mock_api.return_value
+                    mock_api_instance.create_cluster_custom_object.return_value = None
+
+                    runtime_name = executor._create_cluster_training_runtime()
+                    assert runtime_name == "nemo-exp-123"
+                    mock_api_instance.create_cluster_custom_object.assert_called_once()
 
 
 def test_kubeflow_executor_trainjob_with_cluster_training_runtime():
@@ -1533,28 +1545,126 @@ def test_kubeflow_executor_trainjob_with_cluster_training_runtime():
 
 def test_kubeflow_executor_resource_cleanup_complete():
     """Test complete resource cleanup including ConfigMaps, TrainJobs, and ClusterTrainingRuntime."""
-    executor = KubeflowExecutor(packager=ConfigMapPackager())
-    executor.assign("exp-789", "/tmp/exp", "task-3", "task-dir")
+    # Mock Kubernetes setup at initialization time
+    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
+        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+            with patch("kubernetes.client.CoreV1Api") as mock_core_api:
+                # Mock successful Kubernetes setup
+                mock_core_api_instance = mock_core_api.return_value
+                mock_core_api_instance.list_namespace.return_value = None
 
-    with patch.object(executor, "create_trainjob") as mock_create_trainjob:
-        mock_create_trainjob.return_value = "job-789"
+                executor = KubeflowExecutor(packager=ConfigMapPackager())
+                executor.assign("exp-789", "/tmp/exp", "task-3", "task-dir")
 
-        with patch.object(executor.packager, "package") as mock_package:
-            mock_package.return_value = "configmap-789"
+                with patch.object(executor, "create_trainjob") as mock_create_trainjob:
+                    mock_create_trainjob.return_value = "job-789"
 
-            # Submit job
-            job_id = executor.submit(MagicMock(inline="print('hello')"), "test-job-3")
+                    with patch.object(executor.packager, "package") as mock_package:
+                        mock_package.return_value = "configmap-789"
 
-            # Test complete resource cleanup
-            with patch.object(executor, "delete_trainjob") as mock_delete_trainjob:
-                with patch.object(executor, "cleanup_files") as mock_cleanup_files:
-                    with patch.object(executor.packager, "cleanup") as mock_packager_cleanup:
-                        executor.cleanup(job_id)
+                        # Submit job
+                        job_id = executor.submit(MagicMock(inline="print('hello')"), "test-job-3")
 
-                        # Verify all resources are cleaned up
-                        mock_delete_trainjob.assert_called_once_with("job-789")
-                        mock_cleanup_files.assert_called_once()
-                        # Note: ClusterTrainingRuntime cleanup would be handled by the runtime itself
+                        # Test complete resource cleanup with real Kubernetes API calls
+                        with patch.object(executor, "delete_trainjob") as mock_delete_trainjob:
+                            with patch.object(executor, "cleanup_files") as mock_cleanup_files:
+                                with patch("kubernetes.client.CustomObjectsApi") as mock_api:
+                                    # Mock successful deletion
+                                    mock_api_instance = mock_api.return_value
+                                    mock_api_instance.delete_cluster_custom_object.return_value = (
+                                        None
+                                    )
+
+                                    executor.cleanup(job_id)
+
+                                    # Verify all resources are cleaned up
+                                    mock_delete_trainjob.assert_called_once_with("job-789")
+                                    mock_cleanup_files.assert_called_once()
+                                    mock_api_instance.delete_cluster_custom_object.assert_called_once()
+
+
+def test_kubeflow_executor_cluster_training_runtime_configuration():
+    """Test that ClusterTrainingRuntime is created with correct configuration."""
+    # Mock Kubernetes setup at initialization time
+    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
+        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+            with patch("kubernetes.client.CoreV1Api") as mock_core_api:
+                # Mock successful Kubernetes setup
+                mock_core_api_instance = mock_core_api.return_value
+                mock_core_api_instance.list_namespace.return_value = None
+
+                # Test with custom configuration
+                executor = KubeflowExecutor(
+                    nodes=4,
+                    gpus=8,
+                    cpu_limit="16",
+                    memory_limit="64Gi",
+                    image="custom/pytorch:latest",
+                    namespace="training",
+                )
+                executor.assign("exp-config", "/tmp/exp", "task-config", "task-dir")
+
+                # Test that the runtime is created with correct configuration
+                with patch("kubernetes.client.CustomObjectsApi") as mock_api:
+                    mock_api_instance = mock_api.return_value
+                    mock_api_instance.create_cluster_custom_object.return_value = None
+
+                    runtime_name = executor._create_cluster_training_runtime()
+
+                    # Verify the API call was made with correct parameters
+                    mock_api_instance.create_cluster_custom_object.assert_called_once()
+                    call_args = mock_api_instance.create_cluster_custom_object.call_args
+
+                    # Verify the CRD body structure
+                    body = call_args[1]["body"]
+                    assert body["metadata"]["name"] == "nemo-exp-config"
+                    assert body["metadata"]["namespace"] == "training"
+                    assert body["spec"]["containerSpec"]["image"] == "custom/pytorch:latest"
+                    assert body["spec"]["containerSpec"]["resources"]["limits"]["cpu"] == "16"
+                    assert body["spec"]["containerSpec"]["resources"]["limits"]["memory"] == "64Gi"
+                    assert (
+                        body["spec"]["containerSpec"]["resources"]["limits"]["nvidia.com/gpu"]
+                        == "8"
+                    )
+
+
+def test_kubeflow_executor_cluster_training_runtime_minimal_configuration():
+    """Test that ClusterTrainingRuntime is created with minimal configuration."""
+    # Mock Kubernetes setup at initialization time
+    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
+        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+            with patch("kubernetes.client.CoreV1Api") as mock_core_api:
+                # Mock successful Kubernetes setup
+                mock_core_api_instance = mock_core_api.return_value
+                mock_core_api_instance.list_namespace.return_value = None
+
+                # Test with minimal configuration (no resource limits)
+                executor = KubeflowExecutor(nodes=1, namespace="default")
+                executor.assign("exp-minimal", "/tmp/exp", "task-minimal", "task-dir")
+
+                # Test that the runtime is created with minimal configuration
+                with patch("kubernetes.client.CustomObjectsApi") as mock_api:
+                    mock_api_instance = mock_api.return_value
+                    mock_api_instance.create_cluster_custom_object.return_value = None
+
+                    runtime_name = executor._create_cluster_training_runtime()
+
+                    # Verify the API call was made with correct parameters
+                    mock_api_instance.create_cluster_custom_object.assert_called_once()
+                    call_args = mock_api_instance.create_cluster_custom_object.call_args
+
+                    # Verify the CRD body structure
+                    body = call_args[1]["body"]
+                    assert body["metadata"]["name"] == "nemo-exp-minimal"
+                    assert body["metadata"]["namespace"] == "default"
+                    assert (
+                        body["spec"]["containerSpec"]["image"] == "nvcr.io/nvidia/pytorch:23.12-py3"
+                    )
+
+                    # Verify that resource limits are empty when not specified
+                    resources = body["spec"]["containerSpec"]["resources"]
+                    assert resources["limits"] == {}
+                    assert resources["requests"] == {}
 
 
 def test_kubeflow_executor_resource_validation():
@@ -1576,7 +1686,6 @@ def test_kubeflow_executor_resource_validation():
     with pytest.raises(ValueError, match="nodes must be >= 1"):
         executor_invalid = KubeflowExecutor(
             nodes=0,  # Invalid: 0 nodes
-            gpus=-1,  # Invalid: negative GPUs
         )
 
 
