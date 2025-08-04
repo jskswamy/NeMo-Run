@@ -411,7 +411,7 @@ def test_kubeflow_executor_stage_files(
     with patch.object(executor.packager, "package") as mock_package:
         mock_package.return_value = "configmap-name"
 
-        result = executor.stage_files(task_dir)
+        executor.stage_files(task_dir)
 
         # Verify the package method was called with correct arguments
         mock_package.assert_called_once()
@@ -1491,8 +1491,8 @@ def test_kubeflow_executor_configmap_lifecycle_management():
 def test_kubeflow_executor_cluster_training_runtime_creation():
     """Test ClusterTrainingRuntime creation with experiment-specific configurations."""
     # Mock Kubernetes setup at initialization time
-    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
-        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+    with patch("kubernetes.config.load_incluster_config"):
+        with patch("kubernetes.config.load_kube_config"):
             with patch("kubernetes.client.CoreV1Api") as mock_core_api:
                 # Mock successful Kubernetes setup
                 mock_core_api_instance = mock_core_api.return_value
@@ -1546,8 +1546,8 @@ def test_kubeflow_executor_trainjob_with_cluster_training_runtime():
 def test_kubeflow_executor_resource_cleanup_complete():
     """Test complete resource cleanup including ConfigMaps, TrainJobs, and ClusterTrainingRuntime."""
     # Mock Kubernetes setup at initialization time
-    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
-        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+    with patch("kubernetes.config.load_incluster_config"):
+        with patch("kubernetes.config.load_kube_config"):
             with patch("kubernetes.client.CoreV1Api") as mock_core_api:
                 # Mock successful Kubernetes setup
                 mock_core_api_instance = mock_core_api.return_value
@@ -1586,8 +1586,8 @@ def test_kubeflow_executor_resource_cleanup_complete():
 def test_kubeflow_executor_cluster_training_runtime_configuration():
     """Test that ClusterTrainingRuntime is created with correct configuration."""
     # Mock Kubernetes setup at initialization time
-    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
-        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+    with patch("kubernetes.config.load_incluster_config"):
+        with patch("kubernetes.config.load_kube_config"):
             with patch("kubernetes.client.CoreV1Api") as mock_core_api:
                 # Mock successful Kubernetes setup
                 mock_core_api_instance = mock_core_api.return_value
@@ -1609,7 +1609,7 @@ def test_kubeflow_executor_cluster_training_runtime_configuration():
                     mock_api_instance = mock_api.return_value
                     mock_api_instance.create_cluster_custom_object.return_value = None
 
-                    runtime_name = executor._create_cluster_training_runtime()
+                    executor._create_cluster_training_runtime()
 
                     # Verify the API call was made with correct parameters
                     mock_api_instance.create_cluster_custom_object.assert_called_once()
@@ -1631,8 +1631,8 @@ def test_kubeflow_executor_cluster_training_runtime_configuration():
 def test_kubeflow_executor_cluster_training_runtime_minimal_configuration():
     """Test that ClusterTrainingRuntime is created with minimal configuration."""
     # Mock Kubernetes setup at initialization time
-    with patch("kubernetes.config.load_incluster_config") as mock_load_incluster:
-        with patch("kubernetes.config.load_kube_config") as mock_load_kube:
+    with patch("kubernetes.config.load_incluster_config"):
+        with patch("kubernetes.config.load_kube_config"):
             with patch("kubernetes.client.CoreV1Api") as mock_core_api:
                 # Mock successful Kubernetes setup
                 mock_core_api_instance = mock_core_api.return_value
@@ -1647,7 +1647,7 @@ def test_kubeflow_executor_cluster_training_runtime_minimal_configuration():
                     mock_api_instance = mock_api.return_value
                     mock_api_instance.create_cluster_custom_object.return_value = None
 
-                    runtime_name = executor._create_cluster_training_runtime()
+                    executor._create_cluster_training_runtime()
 
                     # Verify the API call was made with correct parameters
                     mock_api_instance.create_cluster_custom_object.assert_called_once()
@@ -1684,7 +1684,7 @@ def test_kubeflow_executor_resource_validation():
 
     # Test with invalid resource configuration (should handle gracefully)
     with pytest.raises(ValueError, match="nodes must be >= 1"):
-        executor_invalid = KubeflowExecutor(
+        KubeflowExecutor(
             nodes=0,  # Invalid: 0 nodes
         )
 
@@ -1706,7 +1706,7 @@ def test_kubeflow_executor_resource_conflict_resolution():
 
             # Should handle resource conflict and retry
             with pytest.raises(Exception, match="Resource conflict"):
-                job_id = executor.submit(MagicMock(inline="print('hello')"), "conflict-job")
+                executor.submit(MagicMock(inline="print('hello')"), "conflict-job")
 
 
 def test_kubeflow_executor_experiment_specific_configurations():
@@ -1725,7 +1725,6 @@ def test_kubeflow_executor_experiment_specific_configurations():
             assert job_id == "job-specific"
 
             # Verify experiment-specific runtime configuration
-            call_args = mock_create_trainjob.call_args
             # The runtime should be configured with experiment-specific settings
             assert executor.runtime_name == "experiment-runtime"
             assert executor.nodes == 2
