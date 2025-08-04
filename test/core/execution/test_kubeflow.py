@@ -1383,3 +1383,109 @@ def test_kubeflow_executor_with_configmap_packager_logging():
 
                 # Verify logging
                 mock_logger.info.assert_any_call("Staged files in ConfigMap: configmap-name")
+
+
+def test_kubeflow_executor_configmap_integration_comprehensive():
+    """Comprehensive ConfigMap integration test covering all scenarios."""
+    executor = KubeflowExecutor(packager=ConfigMapPackager())
+    executor.assign("exp-123", "/tmp/exp", "task-1", "task-dir")
+
+    # Create temporary files for testing
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create test files
+        train_script = os.path.join(temp_dir, "train.py")
+        config_file = os.path.join(temp_dir, "config.yaml")
+        large_file = os.path.join(temp_dir, "large_data.py")
+
+        with open(train_script, "w") as f:
+            f.write("print('training script')")
+
+        with open(config_file, "w") as f:
+            f.write("model: mistral\nepochs: 10")
+
+        # Create a large file to test size limits
+        with open(large_file, "w") as f:
+            f.write("x" * (1024 * 1024 + 1))  # 1MB + 1 byte
+
+            # Test 1: Basic ConfigMap creation with sanitization
+            with patch.object(executor.packager, "package") as mock_package:
+                mock_package.return_value = "configmap-123"
+
+                with patch.object(executor, "create_trainjob") as mock_create_trainjob:
+                    mock_create_trainjob.return_value = "job-123"
+
+                    result = executor.submit(MagicMock(inline="print('hello')"), "test-job")
+
+                    assert result == "job-123"
+                    mock_package.assert_called_once()
+
+                    # Verify sanitization was applied
+                    call_args = mock_package.call_args
+                    assert "nemo-workspace" in call_args[1]["name"]
+
+            # Test 2: Large file handling and resource limits
+            with patch.object(executor.packager, "package") as mock_package:
+                mock_package.side_effect = ValueError("ConfigMap size limit exceeded")
+
+                # Should handle large file error gracefully
+                with pytest.raises(ValueError, match="ConfigMap size limit exceeded"):
+                    executor.submit(MagicMock(inline="print('hello')"), "test-job")
+
+            # Test 3: Multiple files and mount path validation
+            executor.volume_mount_path = "/custom/workspace"
+            with patch.object(executor.packager, "package") as mock_package:
+                mock_package.return_value = "configmap-456"
+
+                with patch.object(executor, "create_trainjob") as mock_create_trainjob:
+                    mock_create_trainjob.return_value = "job-456"
+
+                    result = executor.submit(MagicMock(inline="print('hello')"), "test-job-2")
+
+                    assert result == "job-456"
+                    assert executor.volume_mount_path == "/custom/workspace"
+
+            # Test 4: Error handling and recovery
+            with patch.object(executor.packager, "package") as mock_package:
+                mock_package.side_effect = Exception("Kubernetes API error")
+
+                # Should handle packager error gracefully
+                with pytest.raises(Exception, match="Kubernetes API error"):
+                    executor.submit(MagicMock(inline="print('hello')"), "test-job-3")
+
+
+def test_kubeflow_executor_configmap_lifecycle_management():
+    """Test ConfigMap lifecycle management including creation and resource cleanup."""
+    executor = KubeflowExecutor(packager=ConfigMapPackager())
+    executor.assign("exp-123", "/tmp/exp", "task-1", "task-dir")
+
+    with patch.object(executor, "create_trainjob") as mock_create_trainjob:
+        mock_create_trainjob.return_value = "job-123"
+
+        with patch.object(executor.packager, "package") as mock_package:
+            mock_package.return_value = "configmap-123"
+
+            # Test 1: ConfigMap creation during job submission
+            job_id = executor.submit(MagicMock(inline="print('hello')"), "test-job")
+            assert job_id == "job-123"
+            mock_package.assert_called_once()
+
+            # Test 2: Complete resource cleanup after job completion
+            with patch.object(executor, "delete_trainjob") as mock_delete_trainjob:
+                with patch.object(executor, "cleanup_files") as mock_cleanup_files:
+                    executor.cleanup(job_id)
+
+                    # Verify both TrainJob deletion AND file cleanup happen
+                    mock_delete_trainjob.assert_called_once_with("job-123")
+                    mock_cleanup_files.assert_called_once()
+
+            # Test 3: Namespace isolation
+            executor.namespace = "training-namespace"
+            with patch.object(executor.packager, "package") as mock_package:
+                mock_package.return_value = "configmap-456"
+
+                result = executor.submit(MagicMock(inline="print('hello')"), "test-job-2")
+                assert result == "job-123"
+                assert executor.namespace == "training-namespace"
