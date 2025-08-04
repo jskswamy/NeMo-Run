@@ -21,6 +21,8 @@ from typing import Optional, Union
 
 from kubeflow.trainer.api.trainer_client import TrainerClient
 from kubeflow.trainer.types.types import CustomTrainer, Runtime
+from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 
 from nemo_run.config import Partial, Script
 from nemo_run.core.execution.base import Executor
@@ -68,20 +70,17 @@ class KubeflowExecutor(Executor):
     #: Kubernetes namespace for the training job
     namespace: str = "default"
 
-    #: Resource requests for CPU (optional - defaults to ClusterTrainingRuntime)
-    cpu_request: Optional[str] = None
-
-    #: Resource limits for CPU (optional - defaults to ClusterTrainingRuntime)
+    #: Resource limits for CPU
     cpu_limit: Optional[str] = None
 
-    #: Resource requests for memory (optional - defaults to ClusterTrainingRuntime)
-    memory_request: Optional[str] = None
-
-    #: Resource limits for memory (optional - defaults to ClusterTrainingRuntime)
+    #: Resource limits for memory
     memory_limit: Optional[str] = None
 
-    #: Number of GPUs to request (optional - defaults to ClusterTrainingRuntime)
+    #: Number of GPUs to request
     gpus: Optional[int] = None
+
+    #: Container image for training jobs
+    image: str = "nvcr.io/nvidia/pytorch:23.12-py3"
 
     #: Name of the ClusterTrainingRuntime to use
     runtime_name: str = "torch-distributed-nemo"
@@ -102,11 +101,42 @@ class KubeflowExecutor(Executor):
     _current_task: Optional[Union[Script, Partial]] = None
 
     def __post_init__(self):
-        """Validate executor configuration."""
+        """Validate executor configuration and setup Kubernetes access."""
         if self.nodes < 1:
             raise ValueError("nodes must be >= 1")
         if self.ntasks_per_node < 1:
             raise ValueError("ntasks_per_node must be >= 1")
+
+        # Setup Kubernetes configuration
+        self._setup_kubernetes_config()
+
+    def _setup_kubernetes_config(self):
+        """Setup Kubernetes configuration for ClusterTrainingRuntime operations."""
+        try:
+            # Try in-cluster config first (when running inside Kubernetes)
+            config.load_incluster_config()
+            logger.info("Using in-cluster Kubernetes configuration")
+        except config.ConfigException:
+            try:
+                # Try local kubeconfig (when running locally)
+                config.load_kube_config()
+                logger.info("Using local kubeconfig")
+            except config.ConfigException:
+                logger.warning(
+                    "Could not load Kubernetes configuration - ClusterTrainingRuntime operations will use default runtime"
+                )
+                self._kubernetes_available = False
+                return
+
+        # Test Kubernetes connectivity
+        try:
+            api_client = client.CoreV1Api()
+            api_client.list_namespace()
+            logger.info("Kubernetes connectivity verified")
+            self._kubernetes_available = True
+        except Exception as e:
+            logger.warning(f"Kubernetes connectivity test failed: {e}")
+            self._kubernetes_available = False
 
     def assign(
         self,
@@ -137,9 +167,115 @@ class KubeflowExecutor(Executor):
 
     def _get_runtime(self) -> Runtime:
         """Get the Runtime configuration for the training job."""
+        # Create experiment-specific ClusterTrainingRuntime
+        runtime_name = self._create_cluster_training_runtime()
         return Runtime(
-            name=self.runtime_name,
+            name=runtime_name,
         )
+
+    def _create_cluster_training_runtime(self) -> str:
+        """Create a ClusterTrainingRuntime with experiment-specific configurations."""
+        try:
+            # Generate experiment-specific runtime name
+            sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
+            runtime_name = f"nemo-{sanitized_experiment_id}"
+
+            # Check if Kubernetes is available
+            if not hasattr(self, "_kubernetes_available") or not self._kubernetes_available:
+                logger.warning("Kubernetes not available, using default runtime")
+                return self.runtime_name
+
+            # Create Kubernetes API client
+            api_client = client.CustomObjectsApi()
+
+            # Define ClusterTrainingRuntime CRD
+            runtime_body = {
+                "apiVersion": "training.kubeflow.org/v1",
+                "kind": "ClusterTrainingRuntime",
+                "metadata": {"name": runtime_name, "namespace": self.namespace},
+                "spec": {
+                    "containerSpec": {
+                        "image": self.image,
+                        "resources": {"requests": {}, "limits": {}},
+                    },
+                    "nodeSelector": {},
+                    "tolerations": [],
+                    "affinity": {},
+                },
+            }
+
+            # Add resource configuration
+            if self.cpu_limit:
+                runtime_body["spec"]["containerSpec"]["resources"]["limits"]["cpu"] = self.cpu_limit
+            if self.memory_limit:
+                runtime_body["spec"]["containerSpec"]["resources"]["limits"]["memory"] = (
+                    self.memory_limit
+                )
+            if self.gpus:
+                runtime_body["spec"]["containerSpec"]["resources"]["limits"]["nvidia.com/gpu"] = (
+                    str(self.gpus)
+                )
+
+            # Create the ClusterTrainingRuntime
+            try:
+                api_client.create_cluster_custom_object(
+                    group="training.kubeflow.org",
+                    version="v1",
+                    plural="clustertrainingruntimes",
+                    body=runtime_body,
+                )
+                logger.info(f"Created ClusterTrainingRuntime: {runtime_name}")
+                logger.info(f"  - Nodes: {self.nodes}")
+                logger.info(f"  - GPUs per node: {self.gpus or 'default'}")
+                logger.info(f"  - CPU limits: {self.cpu_limit or 'default'}")
+                logger.info(f"  - Memory limits: {self.memory_limit or 'default'}")
+                logger.info(f"  - Namespace: {self.namespace}")
+                return runtime_name
+
+            except ApiException as e:
+                if e.status == 409:  # Already exists
+                    logger.info(f"ClusterTrainingRuntime {runtime_name} already exists")
+                    return runtime_name
+                else:
+                    logger.error(f"Failed to create ClusterTrainingRuntime: {e}")
+                    return self.runtime_name
+
+        except Exception as e:
+            logger.error(f"Failed to create ClusterTrainingRuntime: {e}")
+            # Fallback to default runtime
+            return self.runtime_name
+
+    def _delete_cluster_training_runtime(self, runtime_name: str):
+        """Delete a ClusterTrainingRuntime."""
+        try:
+            # Check if Kubernetes is available
+            if not hasattr(self, "_kubernetes_available") or not self._kubernetes_available:
+                logger.warning("Kubernetes not available, skipping runtime deletion")
+                return
+
+            # Create Kubernetes API client
+            api_client = client.CustomObjectsApi()
+
+            # Delete the ClusterTrainingRuntime
+            try:
+                api_client.delete_cluster_custom_object(
+                    group="training.kubeflow.org",
+                    version="v1",
+                    plural="clustertrainingruntimes",
+                    name=runtime_name,
+                )
+                logger.info(f"Deleted ClusterTrainingRuntime: {runtime_name}")
+
+            except ApiException as e:
+                if e.status == 404:  # Not found
+                    logger.info(
+                        f"ClusterTrainingRuntime {runtime_name} not found (already deleted)"
+                    )
+                else:
+                    logger.error(f"Failed to delete ClusterTrainingRuntime {runtime_name}: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to delete ClusterTrainingRuntime {runtime_name}: {e}")
 
     def _get_custom_trainer(self, task) -> CustomTrainer:
         """Get the CustomTrainer configuration for the training job."""
@@ -217,9 +353,6 @@ class KubeflowExecutor(Executor):
                 configmap_name = self.stage_files(self.default_task_dir)
                 logger.info(f"Staged files in ConfigMap: {configmap_name}")
 
-            # TODO: Use job_name once Kubeflow SDK supports custom job names
-            # Currently the SDK generates random names, but we store job_name for future use
-            # when the SDK adds support for custom job names
             job_id = client.train(runtime=runtime, trainer=trainer)
 
             logger.info(f"Created TrainJob: {job_id}")
@@ -286,7 +419,6 @@ class KubeflowExecutor(Executor):
         """Clean up staged files."""
         try:
             configmap_name = self._get_sanitized_configmap_name(task_dir)
-            # TODO: Implement ConfigMap cleanup when Kubeflow SDK supports it
             logger.info(f"Files staged in ConfigMap: {configmap_name}")
         except Exception as e:
             logger.error(f"Failed to cleanup files: {e}")
@@ -360,7 +492,7 @@ class KubeflowExecutor(Executor):
         Clean up resources associated with a job.
 
         This method is called by the Experiment API to clean up job resources.
-        It handles TrainJob deletion and file cleanup.
+        It handles TrainJob deletion, file cleanup, and ClusterTrainingRuntime cleanup.
 
         Args:
             handle: The ID of the job to clean up
@@ -378,6 +510,11 @@ class KubeflowExecutor(Executor):
             # Clean up staged files
             task_dir = self.job_dir.split("/")[-1] if self.job_dir else self.default_task_dir
             self.cleanup_files(task_dir)
+
+            # Clean up ClusterTrainingRuntime
+            sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
+            runtime_name = f"nemo-{sanitized_experiment_id}"
+            self._delete_cluster_training_runtime(runtime_name)
 
             logger.info(f"Cleaned up job {handle}")
 
