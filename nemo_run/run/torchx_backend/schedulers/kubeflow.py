@@ -26,6 +26,7 @@ from torchx.specs.api import AppDef, AppState
 
 from nemo_run.core.execution.base import Executor
 from nemo_run.core.execution.kubeflow import KubeflowExecutor
+from nemo_run.core.packaging.configmap import ConfigMapPackager
 from nemo_run.run.torchx_backend.schedulers.api import SchedulerMixin
 
 logger = logging.getLogger(__name__)
@@ -43,11 +44,13 @@ class KubeflowScheduler(SchedulerMixin):
         self,
         session_name: str,
         namespace: str = "default",
+        detach_mode: bool = False,
         **kwargs: Any,
     ) -> None:
         self.backend = "kubeflow"
         self.session_name = session_name
         self.namespace = namespace
+        self.detach_mode = detach_mode
         self._apps: dict[str, dict[str, Any]] = {}
 
     def _submit_dryrun(self, app: AppDef, cfg: Executor) -> AppDryRunInfo[dict[str, Any]]:
@@ -60,23 +63,47 @@ class KubeflowScheduler(SchedulerMixin):
         job_config = self._appdef_to_kubeflow_config(app, cfg)
 
         return AppDryRunInfo(
-            app_id=f"kubeflow://{self.session_name}/{app.name}",
-            app=app,
-            request=job_config,
-            repr=f"Kubeflow job: {app.name}",
+            job_config,
+            lambda _: f"Kubeflow job: {app.name}",
         )
 
     def schedule(self, dryrun_info: AppDryRunInfo[dict[str, Any]]) -> str:
         """Submit the job to Kubeflow."""
-        app = dryrun_info.app
-        cfg = dryrun_info.request["executor"]
+        job_config = dryrun_info.request
+        cfg = job_config["executor"]
 
         # Create the TrainJob using KubeflowExecutor
-        job_id = cfg.create_trainjob(app.name)
+        # Extract the task from the app definition
+        app = job_config["app"]
+        task = None
+
+        # Try to extract task from the app roles
+        if app.roles and len(app.roles) > 0:
+            main_role = app.roles[0]
+            if main_role.args:
+                # Create a simple task object for the executor
+                from nemo_run.config import Script
+
+                task = Script(inline=" ".join(main_role.args))
+
+        if task is None:
+            # Create a default task if none found
+            from nemo_run.config import Script
+
+            task = Script(inline="echo 'No task specified'")
+
+        # Stage files via ConfigMap if configured
+        try:
+            if isinstance(cfg.packager, ConfigMapPackager):
+                cfg.stage_files(cfg.default_task_dir, task)
+        except Exception as e:
+            logger.error(f"Failed to stage files via ConfigMapPackager: {e}")
+
+        job_id = cfg.create_trainjob(job_config["app"].name, task)
 
         # Store job info for later reference
         self._apps[job_id] = {
-            "app": app,
+            "app": job_config["app"],
             "executor": cfg,
             "job_id": job_id,
             "state": AppState.SUBMITTED,
@@ -103,7 +130,7 @@ class KubeflowScheduler(SchedulerMixin):
                 state=app_state,
                 num_restarts=0,  # Kubeflow handles restarts internally
                 msg=f"Kubeflow job status: {status}",
-                structured_error_msg=None,
+                structured_error_msg="",
                 roles_statuses=[],
             )
         except Exception as e:
@@ -166,12 +193,10 @@ class KubeflowScheduler(SchedulerMixin):
             # If we have a script with inline content, extract it
             if len(main_role.args) >= 2 and main_role.args[0] == "python":
                 # This is a file-based execution
-                cfg.python_file = main_role.args[1]
+                logger.info(f"File-based execution: {main_role.args[1]}")
             elif len(main_role.args) >= 2 and main_role.args[0] == "-c":
                 # This is inline script execution
-                script_content = main_role.args[1]
-                # For now, we'll create a temporary file or use a default
-                cfg.python_file = "inline_script.py"
+                logger.info("Inline script execution detected")
                 logger.warning("Inline script execution not fully implemented yet")
 
         return {
@@ -195,15 +220,39 @@ class KubeflowScheduler(SchedulerMixin):
         else:
             return AppState.UNKNOWN
 
+    def _validate(self, app: AppDef, scheduler: str) -> None:
+        """Validate the app definition for Kubeflow."""
+        # For now, skip validation as Kubeflow handles this internally
+        pass
+
+    def close(self) -> None:
+        """Clean up resources when the scheduler is closed."""
+        # Cancel all running jobs unless in detach mode
+        for app_id in list(self._apps.keys()):
+            try:
+                # Check if scheduler is in detach mode
+                if self.detach_mode:
+                    logger.info(f"Skipping cleanup for job {app_id} in detach mode")
+                    continue
+
+                self.cancel(app_id)
+            except Exception as e:
+                logger.error(f"Failed to cancel job {app_id} during close: {e}")
+
+        # Clear the apps dictionary
+        self._apps.clear()
+
 
 def create_scheduler(
     session_name: str,
     namespace: str = "default",
+    detach_mode: bool = False,
     **kwargs: Any,
 ) -> KubeflowScheduler:
     """Create a Kubeflow scheduler instance."""
     return KubeflowScheduler(
         session_name=session_name,
         namespace=namespace,
+        detach_mode=detach_mode,
         **kwargs,
     )
