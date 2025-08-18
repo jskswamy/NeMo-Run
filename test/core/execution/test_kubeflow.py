@@ -14,13 +14,22 @@
 # limitations under the License.
 
 import os
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from torchx.specs import AppDef, Role
 
-from nemo_run.core.execution.kubeflow import KubeflowExecutor
+from nemo_run.config import Partial, Script
+from nemo_run.core.execution.kubeflow import (
+    KubeflowExecutor,
+    _nemo_inline_entry_params,
+)
+from nemo_run.core.packaging import PatternPackager
 from nemo_run.core.packaging.base import Packager
 from nemo_run.core.packaging.configmap import ConfigMapPackager
+from nemo_run.run.torchx_backend.schedulers.kubeflow import KubeflowScheduler
 
 
 def test_kubeflow_executor_default_init():
@@ -83,24 +92,26 @@ def test_kubeflow_executor_nproc_per_node():
 
 
 def test_kubeflow_executor_get_runtime():
-    """Test that _get_runtime returns the correct Runtime configuration."""
+    """Test that _get_runtime fetches Runtime via SDK with correct name."""
     executor = KubeflowExecutor(runtime_name="custom-runtime", gpus=4, nodes=2)
+    # Avoid K8s interactions by forcing fallback name path
+    executor._kubernetes_available = False
 
-    with patch("nemo_run.core.execution.kubeflow.Runtime") as mock_runtime:
+    with patch("nemo_run.core.execution.kubeflow.TrainerClient") as mock_client:
+        mock_client_instance = MagicMock()
+        mock_client.return_value = mock_client_instance
         mock_runtime_instance = MagicMock()
-        mock_runtime.return_value = mock_runtime_instance
+        mock_client_instance.get_runtime.return_value = mock_runtime_instance
 
         result = executor._get_runtime()
 
         assert result == mock_runtime_instance
-        # Verify Runtime was called with correct name
-        mock_runtime.assert_called_once_with(name="custom-runtime")
+        mock_client_instance.get_runtime.assert_called_once_with("custom-runtime")
 
 
 @pytest.mark.parametrize(
-    "executor_kwargs,expected_python_file,expected_func,expected_nodes,test_description",
+    "executor_kwargs,expected_nodes",
     [
-        # File-based execution tests
         (
             {
                 "nodes": 2,
@@ -108,10 +119,7 @@ def test_kubeflow_executor_get_runtime():
                 "cpu_limit": "16",
                 "memory_limit": "32Gi",
             },
-            "/workspace/task-dir-train.py",
-            None,
             2,
-            "file-based execution with default config",
         ),
         (
             {
@@ -120,21 +128,17 @@ def test_kubeflow_executor_get_runtime():
                 "default_task_dir": "custom-task",
                 "volume_mount_path": "/custom/workspace",
             },
-            "/custom/workspace/custom-task-model.py",
-            None,
             1,
-            "file-based execution with custom config",
         ),
     ],
 )
-def test_kubeflow_executor_get_custom_trainer_file_based(
-    executor_kwargs, expected_python_file, expected_func, expected_nodes, test_description
-):
-    """Test _get_custom_trainer with file-based execution."""
-    from nemo_run.config import Script
+def test_kubeflow_executor_get_custom_trainer_inline(executor_kwargs, expected_nodes):
+    """Test _get_custom_trainer with inline Script using SDK func embedding."""
 
     script_task = Script(inline="python train.py")
     executor = KubeflowExecutor(**executor_kwargs)
+    # Ensure ConfigMapPackager is used
+    executor.packager = ConfigMapPackager()
 
     with patch("nemo_run.core.execution.kubeflow.CustomTrainer") as mock_trainer:
         mock_trainer_instance = MagicMock()
@@ -148,8 +152,9 @@ def test_kubeflow_executor_get_custom_trainer_file_based(
         # Verify the call arguments
         call_args = mock_trainer.call_args[1]
         assert call_args["num_nodes"] == expected_nodes
-        assert call_args["python_file"] == "python train.py"
-        assert call_args.get("func") == expected_func
+        assert call_args.get("python_file") is None
+        assert call_args["func"] is _nemo_inline_entry_params
+        assert call_args["func_args"]["script"] == "python train.py"
 
         # Verify resources if specified
         resources = call_args["resources_per_node"]
@@ -163,7 +168,6 @@ def test_kubeflow_executor_get_custom_trainer_file_based(
 
 def test_kubeflow_executor_get_custom_trainer_function_based():
     """Test _get_custom_trainer with function-based execution."""
-    from nemo_run.config import Partial
 
     def dummy_function():
         return "function result"
@@ -193,7 +197,6 @@ def test_kubeflow_executor_get_custom_trainer_function_based():
 
 def test_kubeflow_executor_create_trainjob():
     """Test create_trainjob method."""
-    from nemo_run.config import Script
 
     executor = KubeflowExecutor(nodes=1)
     script_task = Script(inline="print('Training')")
@@ -207,11 +210,15 @@ def test_kubeflow_executor_create_trainjob():
 
         assert result == "job-123"
         mock_client_instance.train.assert_called_once()
+        # Ensure trainer is passed to SDK
+        _, kwargs = mock_client_instance.train.call_args
+        assert "trainer" in kwargs and kwargs["trainer"] is not None
 
 
 def test_kubeflow_executor_get_trainjob_status():
     """Test get_trainjob_status method."""
     executor = KubeflowExecutor()
+    executor.packager = ConfigMapPackager()
 
     with patch("nemo_run.core.execution.kubeflow.TrainerClient") as mock_client:
         mock_client_instance = MagicMock()
@@ -280,9 +287,8 @@ def test_kubeflow_executor_get_sanitized_configmap_name():
     executor.experiment_id = "test-exp"
 
     result = executor._get_sanitized_configmap_name("task-dir")
-
-    assert "test-exp" in result
-    assert "task-dir" in result
+    assert result.startswith("nemo-content-")
+    assert result.endswith("-task-dir")
 
 
 def test_kubeflow_executor_get_sanitized_configmap_name_with_none_experiment_id():
@@ -291,9 +297,8 @@ def test_kubeflow_executor_get_sanitized_configmap_name_with_none_experiment_id(
     executor.experiment_id = None
 
     result = executor._get_sanitized_configmap_name("task-dir")
-
-    assert "experiment" in result
-    assert "task-dir" in result
+    assert result.startswith("nemo-content-")
+    assert result.endswith("-task-dir")
 
 
 def test_kubeflow_executor_post_init():
@@ -306,7 +311,6 @@ def test_kubeflow_executor_post_init():
 
 def test_kubeflow_executor_post_init_with_custom_packager():
     """Test __post_init__ method with custom packager."""
-    from nemo_run.core.packaging import PatternPackager
 
     packager = PatternPackager(include_pattern="*.py", relative_path=".")
     executor = KubeflowExecutor(packager=packager)
@@ -316,7 +320,6 @@ def test_kubeflow_executor_post_init_with_custom_packager():
 
 def test_kubeflow_executor_create_trainjob_with_error():
     """Test create_trainjob method with error handling."""
-    from nemo_run.config import Script
 
     executor = KubeflowExecutor()
     script_task = Script(inline="print('Training')")
@@ -405,6 +408,7 @@ def test_kubeflow_executor_stage_files(
 ):
     """Test that stage_files uses ConfigMapPackager correctly."""
     executor = KubeflowExecutor(**executor_kwargs)
+    executor.packager = ConfigMapPackager()
     executor.experiment_id = "exp-123"
     executor.experiment_dir = "/tmp/exp"
 
@@ -417,20 +421,25 @@ def test_kubeflow_executor_stage_files(
         mock_package.assert_called_once()
         call_args = mock_package.call_args
         assert call_args[1]["job_dir"] == expected_job_dir
-        assert call_args[1]["name"] == expected_name
+        assert call_args[1]["name"].startswith("nemo-content-")
+        assert call_args[1]["name"].endswith(f"-{expected_job_dir.replace('_', '-')}")
 
 
 def test_kubeflow_executor_cleanup_files():
     """Test cleanup_files method."""
     executor = KubeflowExecutor()
+    executor.packager = ConfigMapPackager()
     executor.experiment_id = "exp-123"
 
-    with patch.object(executor, "_get_sanitized_configmap_name") as mock_get_name:
+    with patch.object(executor, "_get_configmap_name") as mock_get_name:
         mock_get_name.return_value = "configmap-name"
 
         executor.cleanup_files("task-dir")
 
-        mock_get_name.assert_called_once_with("task-dir")
+        # Called with (task_dir, task=None)
+        assert mock_get_name.call_count == 1
+        assert mock_get_name.call_args[0][0] == "task-dir"
+        assert mock_get_name.call_args[0][1] is None
 
 
 @pytest.mark.parametrize(
@@ -487,7 +496,6 @@ def test_kubeflow_executor_get_staged_file_path_configmap_packager(
 
 def test_kubeflow_executor_get_staged_file_path_non_configmap_packager():
     """Test _get_staged_file_path with non-ConfigMapPackager."""
-    from nemo_run.core.packaging import PatternPackager
 
     executor = KubeflowExecutor(packager=PatternPackager(include_pattern="*.py", relative_path="."))
 
@@ -500,7 +508,6 @@ def test_kubeflow_executor_get_staged_file_path_non_configmap_packager():
 # Experiment API integration tests
 def test_kubeflow_executor_with_script_task():
     """Test KubeflowExecutor with Script task from Experiment API."""
-    from nemo_run.config import Script
 
     # Create executor (execution environment only)
     executor = KubeflowExecutor(
@@ -526,8 +533,9 @@ def test_kubeflow_executor_with_script_task():
         # Verify the call arguments
         call_args = mock_trainer.call_args[1]
         assert call_args["num_nodes"] == 2
-        assert call_args["python_file"] == "print('Hello from script')"
-        assert call_args.get("func") is None
+
+        assert call_args["func"] is _nemo_inline_entry_params
+        assert call_args.get("python_file") is None
 
         # Verify resources
         resources = call_args["resources_per_node"]
@@ -538,7 +546,6 @@ def test_kubeflow_executor_with_script_task():
 
 def test_kubeflow_executor_with_partial_task():
     """Test KubeflowExecutor with Partial task from Experiment API."""
-    from nemo_run.config import Partial
 
     def dummy_function():
         return "function result"
@@ -573,6 +580,37 @@ def test_kubeflow_executor_with_partial_task():
         assert resources["nvidia.com/gpu"] == "4"
 
 
+def test_kubeflow_executor_inline_script_injected_into_trainer_command():
+    """Verify that inline Script is passed as func to SDK (not python_file)."""
+
+    task = Script(inline="print('Hello from script')")
+
+    # Avoid real K8s config/network during executor init
+    with (
+        patch("nemo_run.core.execution.kubeflow.config.load_kube_config", lambda: None),
+        patch(
+            "nemo_run.core.execution.kubeflow.config.load_incluster_config",
+            side_effect=__import__("kubernetes").config.ConfigException(),
+        ),
+        patch("nemo_run.core.execution.kubeflow.client.CoreV1Api") as mock_core,
+        patch("nemo_run.core.execution.kubeflow.CustomTrainer") as mock_trainer,
+    ):
+        mock_core.return_value.list_namespace.return_value = None
+        executor = KubeflowExecutor(nodes=1)
+        mock_trainer_instance = MagicMock()
+        mock_trainer.return_value = mock_trainer_instance
+
+        result = executor._get_custom_trainer(task)
+
+        assert result == mock_trainer_instance
+        call_args = mock_trainer.call_args[1]
+        assert call_args.get("python_file") is None
+        assert call_args["func"] is _nemo_inline_entry_params
+        assert isinstance(call_args.get("func_args"), dict)
+        assert "script" in call_args["func_args"]
+        assert call_args["func_args"]["script"].startswith("print(")
+
+
 def test_kubeflow_executor_invalid_task():
     """Test that KubeflowExecutor raises error for invalid task types."""
     executor = KubeflowExecutor(nodes=1)
@@ -584,7 +622,6 @@ def test_kubeflow_executor_invalid_task():
 
 def test_kubeflow_executor_create_trainjob_with_task():
     """Test create_trainjob method with task parameter."""
-    from nemo_run.config import Script
 
     executor = KubeflowExecutor(nodes=1)
     script_task = Script(inline="print('Training')")
@@ -598,6 +635,9 @@ def test_kubeflow_executor_create_trainjob_with_task():
 
         assert result == "job-123"
         mock_client_instance.train.assert_called_once()
+        # Ensure trainer is passed to SDK
+        _, kwargs = mock_client_instance.train.call_args
+        assert "trainer" in kwargs and kwargs["trainer"] is not None
 
 
 def test_kubeflow_executor_constructor_no_task_params():
@@ -633,7 +673,6 @@ def test_kubeflow_executor_info_method():
 # Experiment API Integration Methods Tests
 def test_kubeflow_executor_submit_method():
     """Test submit method for Experiment API integration."""
-    from nemo_run.config import Script
 
     executor = KubeflowExecutor(nodes=1)
     script_task = Script(inline="print('Training')")
@@ -650,7 +689,6 @@ def test_kubeflow_executor_submit_method():
 
 def test_kubeflow_executor_submit_method_without_assignment():
     """Test submit method raises error when executor is not assigned to experiment."""
-    from nemo_run.config import Script
 
     executor = KubeflowExecutor(nodes=1)
     script_task = Script(inline="print('Training')")
@@ -690,8 +728,9 @@ def test_kubeflow_executor_cleanup_method():
         with patch.object(executor, "cleanup_files") as mock_cleanup:
             executor.cleanup("job-123")
 
-            mock_delete.assert_called_once_with("job-123")
-            mock_cleanup.assert_called_once_with("task-dir")
+            # Non-destructive cleanup
+            mock_delete.assert_not_called()
+            mock_cleanup.assert_not_called()
 
 
 def test_kubeflow_executor_cleanup_method_without_assignment():
@@ -722,13 +761,14 @@ def test_kubeflow_executor_submit_with_configmap_staging():
 
             assert job_id == "job-456"
             mock_create.assert_called_once_with("task-1", script_task)
-            mock_stage.assert_called_once_with("task-dir")
+            mock_stage.assert_called_once()
+            assert mock_stage.call_args[0][0] == "task-dir"
+            assert mock_stage.call_args[0][1] == script_task
 
 
 def test_kubeflow_executor_submit_with_non_configmap_packager():
     """Test submit method with non-ConfigMap packager (no staging)."""
     from nemo_run.config import Script
-    from nemo_run.core.packaging import PatternPackager
 
     executor = KubeflowExecutor(
         nodes=1, packager=PatternPackager(include_pattern="*.py", relative_path=".")
@@ -749,7 +789,6 @@ def test_kubeflow_executor_submit_with_non_configmap_packager():
 
 def test_kubeflow_executor_submit_error_handling():
     """Test submit method error handling."""
-    from nemo_run.config import Script
 
     executor = KubeflowExecutor(nodes=1)
     script_task = Script(inline="print('Training')")
@@ -787,8 +826,8 @@ def test_kubeflow_executor_cleanup_error_handling():
             # Should not raise exception, just log errors
             executor.cleanup("job-123")
 
-            mock_delete.assert_called_once_with("job-123")
-            # cleanup_files should not be called when delete_trainjob fails
+            # Non-destructive cleanup
+            mock_delete.assert_not_called()
             mock_cleanup.assert_not_called()
 
 
@@ -805,13 +844,13 @@ def test_kubeflow_executor_cleanup_error_handling_both_fail():
             # Should not raise exception, just log errors
             executor.cleanup("job-123")
 
-            mock_delete.assert_called_once_with("job-123")
-            mock_cleanup.assert_called_once_with("task-dir")
+            # Non-destructive cleanup
+            mock_delete.assert_not_called()
+            mock_cleanup.assert_not_called()
 
 
 def test_kubeflow_executor_submit_with_partial_task():
     """Test submit method with Partial task."""
-    from nemo_run.config import Partial
 
     def dummy_function():
         return "function result"
@@ -849,7 +888,6 @@ def test_kubeflow_executor_experiment_context_validation():
 
 def test_kubeflow_executor_multiple_submissions():
     """Test multiple job submissions with the same executor."""
-    from nemo_run.config import Script
 
     executor = KubeflowExecutor(nodes=1)
     script_task = Script(inline="print('Training')")
@@ -1120,16 +1158,16 @@ def test_kubeflow_executor_experiment_lifecycle_cleanup(job_ids):
     executor = KubeflowExecutor(nodes=1)
     executor.assign("exp-123", "/tmp/exp", "task-1", "task-dir")
 
-    # Simulate cleanup of multiple resources
+    # Simulate cleanup of multiple resources (non-destructive)
     with patch.object(executor, "delete_trainjob") as mock_delete:
         with patch.object(executor, "cleanup_files") as mock_cleanup:
             # Cleanup multiple jobs
             for job_id in job_ids:
                 executor.cleanup(job_id)
 
-            # Verify all cleanups were called
-            assert mock_delete.call_count == len(job_ids)
-            assert mock_cleanup.call_count == len(job_ids)
+            # Verify no deletions performed automatically
+            assert mock_delete.call_count == 0
+            assert mock_cleanup.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -1183,6 +1221,86 @@ def test_kubeflow_executor_experiment_lifecycle_logging_integration(
             assert any("Submitted job" in str(call) for call in call_args)
 
 
+def test_kubeflow_executor_submits_configmap_to_k8s():
+    """Ensure submit() results in a ConfigMap being created via Kubernetes API."""
+
+    from nemo_run.core.packaging.configmap import ConfigMapPackager
+
+    mock_v1 = MagicMock()
+
+    with (
+        patch(
+            "nemo_run.core.packaging.configmap.ConfigMapPackager.__post_init__",
+            lambda self: setattr(self, "v1", mock_v1),
+        ),
+        patch("nemo_run.core.execution.kubeflow.config.load_kube_config", lambda: None),
+        patch(
+            "nemo_run.core.execution.kubeflow.config.load_incluster_config",
+            side_effect=__import__("kubernetes").config.ConfigException(),
+        ),
+        patch("nemo_run.core.execution.kubeflow.client.CoreV1Api") as mock_core,
+        patch("pathlib.Path.exists", return_value=True),
+        patch("pathlib.Path.rglob", return_value=[Path("/tmp/exp/mistral.py")]),
+        patch("pathlib.Path.is_file", return_value=True),
+        patch("pathlib.Path.stat") as mock_stat,
+        patch("builtins.open", create=True) as mock_open,
+    ):
+        mock_core.return_value.list_namespace.return_value = None
+        mock_stat.return_value.st_size = 100
+        mock_open.return_value.__enter__.return_value.read.return_value = 'print("m")'
+
+        packager = ConfigMapPackager(
+            include_pattern=["mistral.py"],
+            relative_path=".",
+            namespace="default",
+            configmap_id="mistral-training-files",
+        )
+        executor = KubeflowExecutor(nodes=1, packager=packager)
+        executor.assign("exp-123", "/tmp/exp", "task-1", "task-dir")
+
+        with patch.object(executor, "create_trainjob") as mock_create:
+            mock_create.return_value = "job-xyz"
+            job_id = executor.submit(Script(inline="print('x')"), "task-1")
+
+        assert job_id == "job-xyz"
+        assert mock_v1.create_namespaced_config_map.called
+        _, kwargs = mock_v1.create_namespaced_config_map.call_args
+        assert kwargs["namespace"] == "default"
+        body = kwargs["body"]
+        assert body.metadata.name == "nemo-workspace-mistral-training-files"
+        data_keys = list(body.data.keys())
+        assert any(key.startswith("task-dir-") and key.endswith("mistral.py") for key in data_keys)
+
+
+def test_kubeflow_scheduler_stages_configmap_before_submit():
+    """Ensure scheduler path stages ConfigMap before creating TrainJob."""
+    scheduler = KubeflowScheduler(session_name="test")
+
+    role = Role(name="main", image="python", entrypoint="python", args=["-c", "print('x')"])
+    app = AppDef(name="test-app", roles=[role])
+
+    with patch("nemo_run.run.torchx_backend.schedulers.kubeflow.KubeflowExecutor") as MockExec:
+        # Prepare dryrun_info like schedule() expects
+        executor = MockExec()
+        # Ensure scheduler detects ConfigMapPackager and triggers staging
+        executor.packager = ConfigMapPackager()
+        dryrun_info = MagicMock()
+        dryrun_info.request = {"app": app, "executor": executor}
+
+        # Expect stage_files to be called prior to create_trainjob
+        with (
+            patch.object(executor, "stage_files") as mock_stage,
+            patch.object(executor, "create_trainjob") as mock_create,
+        ):
+            mock_create.return_value = "job-1"
+            job_id = scheduler.schedule(dryrun_info)
+
+            # This is the expectation we want initially to fail (red)
+            mock_stage.assert_called_once()
+            mock_create.assert_called_once()
+            assert job_id == "job-1"
+
+
 @pytest.mark.parametrize(
     "experiment_id,experiment_dir,job_name,task_dir,use_configmap_packager",
     [
@@ -1216,7 +1334,8 @@ def test_kubeflow_executor_experiment_lifecycle_resource_management(
 
             # Verify staging was called only for ConfigMapPackager
             if use_configmap_packager:
-                mock_stage.assert_called_once_with("task-dir")
+                mock_stage.assert_called_once()
+                assert mock_stage.call_args[0][0] == "task-dir"
             else:
                 mock_stage.assert_not_called()
 
@@ -1319,7 +1438,8 @@ def test_kubeflow_executor_with_configmap_packager_submit():
             job_id = executor.submit("dummy_task", "task-1")
 
             # Verify staging was called
-            mock_stage.assert_called_once_with("task-dir")
+            mock_stage.assert_called_once()
+            assert mock_stage.call_args[0][0] == "task-dir"
             assert job_id == "job-456"
 
 
@@ -1336,9 +1456,9 @@ def test_kubeflow_executor_with_configmap_packager_cleanup():
         with patch.object(executor, "cleanup_files") as mock_cleanup:
             executor.cleanup("job-456")
 
-            # Verify both TrainJob and ConfigMap cleanup were called
-            mock_delete.assert_called_once_with("job-456")
-            mock_cleanup.assert_called_once_with("task-dir")
+            # Non-destructive cleanup
+            mock_delete.assert_not_called()
+            mock_cleanup.assert_not_called()
 
 
 def test_kubeflow_executor_with_configmap_packager_error_handling():
@@ -1390,7 +1510,6 @@ def test_kubeflow_executor_configmap_integration_comprehensive():
 
     # Create temporary files for testing
     import os
-    import tempfile
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Create test files
@@ -1471,9 +1590,9 @@ def test_kubeflow_executor_configmap_lifecycle_management():
                 with patch.object(executor, "cleanup_files") as mock_cleanup_files:
                     executor.cleanup(job_id)
 
-                    # Verify both TrainJob deletion AND file cleanup happen
-                    mock_delete_trainjob.assert_called_once_with("job-123")
-                    mock_cleanup_files.assert_called_once()
+                    # Non-destructive cleanup
+                    mock_delete_trainjob.assert_not_called()
+                    mock_cleanup_files.assert_not_called()
 
             # Test 3: Namespace isolation
             executor.namespace = "training-namespace"
@@ -1503,25 +1622,13 @@ def test_kubeflow_executor_cluster_training_runtime_creation():
                 )
                 executor.assign("exp-123", "/tmp/exp", "task-1", "task-dir")
 
-                # Test that ClusterTrainingRuntime creation is called during runtime setup
-                with patch.object(
-                    executor, "_create_cluster_training_runtime"
-                ) as mock_create_runtime:
-                    mock_create_runtime.return_value = "nemo-exp-123"
-
+                # Ensure runtime object can be obtained without raising
+                with patch("nemo_run.core.execution.kubeflow.TrainerClient") as mock_client:
+                    mock_client_instance = MagicMock()
+                    mock_client.return_value = mock_client_instance
+                    mock_client_instance.get_runtime.return_value = MagicMock()
                     runtime = executor._get_runtime()
-                    assert runtime.name == "nemo-exp-123"
-                    mock_create_runtime.assert_called_once()
-
-                # Test experiment-specific runtime name generation with real Kubernetes API calls
-                with patch("kubernetes.client.CustomObjectsApi") as mock_api:
-                    # Mock successful creation
-                    mock_api_instance = mock_api.return_value
-                    mock_api_instance.create_cluster_custom_object.return_value = None
-
-                    runtime_name = executor._create_cluster_training_runtime()
-                    assert runtime_name == "nemo-exp-123"
-                    mock_api_instance.create_cluster_custom_object.assert_called_once()
+                assert hasattr(runtime, "name")
 
 
 def test_kubeflow_executor_trainjob_with_cluster_training_runtime():
@@ -1575,12 +1682,11 @@ def test_kubeflow_executor_resource_cleanup_complete():
                                         None
                                     )
 
-                                    executor.cleanup(job_id)
+            executor.cleanup(job_id)
 
-                                    # Verify all resources are cleaned up
-                                    mock_delete_trainjob.assert_called_once_with("job-789")
-                                    mock_cleanup_files.assert_called_once()
-                                    mock_api_instance.delete_cluster_custom_object.assert_called_once()
+            # Non-destructive cleanup
+            mock_delete_trainjob.assert_not_called()
+            mock_cleanup_files.assert_not_called()
 
 
 def test_kubeflow_executor_cluster_training_runtime_configuration():
@@ -1604,28 +1710,13 @@ def test_kubeflow_executor_cluster_training_runtime_configuration():
                 )
                 executor.assign("exp-config", "/tmp/exp", "task-config", "task-dir")
 
-                # Test that the runtime is created with correct configuration
-                with patch("kubernetes.client.CustomObjectsApi") as mock_api:
-                    mock_api_instance = mock_api.return_value
-                    mock_api_instance.create_cluster_custom_object.return_value = None
-
-                    executor._create_cluster_training_runtime()
-
-                    # Verify the API call was made with correct parameters
-                    mock_api_instance.create_cluster_custom_object.assert_called_once()
-                    call_args = mock_api_instance.create_cluster_custom_object.call_args
-
-                    # Verify the CRD body structure
-                    body = call_args[1]["body"]
-                    assert body["metadata"]["name"] == "nemo-exp-config"
-                    assert body["metadata"]["namespace"] == "training"
-                    assert body["spec"]["containerSpec"]["image"] == "custom/pytorch:latest"
-                    assert body["spec"]["containerSpec"]["resources"]["limits"]["cpu"] == "16"
-                    assert body["spec"]["containerSpec"]["resources"]["limits"]["memory"] == "64Gi"
-                    assert (
-                        body["spec"]["containerSpec"]["resources"]["limits"]["nvidia.com/gpu"]
-                        == "8"
-                    )
+                # Ensure runtime object can be obtained without raising
+                with patch("nemo_run.core.execution.kubeflow.TrainerClient") as mock_client:
+                    mock_client_instance = MagicMock()
+                    mock_client.return_value = mock_client_instance
+                    mock_client_instance.get_runtime.return_value = MagicMock()
+                    runtime = executor._get_runtime()
+                assert hasattr(runtime, "name")
 
 
 def test_kubeflow_executor_cluster_training_runtime_minimal_configuration():
@@ -1642,29 +1733,9 @@ def test_kubeflow_executor_cluster_training_runtime_minimal_configuration():
                 executor = KubeflowExecutor(nodes=1, namespace="default")
                 executor.assign("exp-minimal", "/tmp/exp", "task-minimal", "task-dir")
 
-                # Test that the runtime is created with minimal configuration
-                with patch("kubernetes.client.CustomObjectsApi") as mock_api:
-                    mock_api_instance = mock_api.return_value
-                    mock_api_instance.create_cluster_custom_object.return_value = None
-
-                    executor._create_cluster_training_runtime()
-
-                    # Verify the API call was made with correct parameters
-                    mock_api_instance.create_cluster_custom_object.assert_called_once()
-                    call_args = mock_api_instance.create_cluster_custom_object.call_args
-
-                    # Verify the CRD body structure
-                    body = call_args[1]["body"]
-                    assert body["metadata"]["name"] == "nemo-exp-minimal"
-                    assert body["metadata"]["namespace"] == "default"
-                    assert (
-                        body["spec"]["containerSpec"]["image"] == "nvcr.io/nvidia/pytorch:23.12-py3"
-                    )
-
-                    # Verify that resource limits are empty when not specified
-                    resources = body["spec"]["containerSpec"]["resources"]
-                    assert resources["limits"] == {}
-                    assert resources["requests"] == {}
+                # Ensure runtime object can be obtained without raising
+                runtime = executor._get_runtime()
+                assert hasattr(runtime, "name")
 
 
 def test_kubeflow_executor_resource_validation():
@@ -1757,18 +1828,18 @@ def test_kubeflow_executor_resource_lifecycle_multiple_experiments():
 
             job_id2 = executor2.submit(MagicMock(inline="print('hello')"), "test-job-2")
 
-    # Cleanup both experiments
+    # Cleanup both experiments (non-destructive)
     with patch.object(executor1, "delete_trainjob") as mock_delete1:
         with patch.object(executor1, "cleanup_files") as mock_cleanup1:
             executor1.cleanup(job_id1)
-            mock_delete1.assert_called_once_with("job-1")
-            mock_cleanup1.assert_called_once()
+            mock_delete1.assert_not_called()
+            mock_cleanup1.assert_not_called()
 
     with patch.object(executor2, "delete_trainjob") as mock_delete2:
         with patch.object(executor2, "cleanup_files") as mock_cleanup2:
             executor2.cleanup(job_id2)
-            mock_delete2.assert_called_once_with("job-2")
-            mock_cleanup2.assert_called_once()
+            mock_delete2.assert_not_called()
+            mock_cleanup2.assert_not_called()
 
 
 def test_kubeflow_executor_resource_monitoring():

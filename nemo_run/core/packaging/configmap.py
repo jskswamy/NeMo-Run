@@ -41,6 +41,7 @@ class ConfigMapPackager(Packager):
     relative_path: str | List[str] = "."
     namespace: str = "default"
     configmap_prefix: str = "nemo-workspace"
+    configmap_id: Optional[str] = None  # Reusable configmap identifier
 
     def __post_init__(self):
         """Initialize the Kubernetes client."""
@@ -111,11 +112,12 @@ class ConfigMapPackager(Packager):
         Returns:
             The name of the created ConfigMap (or intended name if not created)
         """
+        # Resolve the final ConfigMap name centrally
+        configmap_name = self.resolve_configmap_name(name)
+
         if self.v1 is None:
             logger.warning("Kubernetes client not available, skipping ConfigMap creation")
-            return f"{self.configmap_prefix}-{name}"
-
-        configmap_name = f"{self.configmap_prefix}-{name}"
+            return configmap_name
         files_to_stage = self._find_files_to_package(path)
         if not files_to_stage:
             logger.warning("No files found to package into ConfigMap")
@@ -165,6 +167,18 @@ class ConfigMapPackager(Packager):
                 logger.error(f"Failed to create ConfigMap {configmap_name}: {e}")
         return configmap_name
 
+    def resolve_configmap_name(self, name: str) -> str:
+        """
+        Resolve the full ConfigMap name from a caller-provided suffix.
+
+        Centralizes naming logic so callers never assemble full names.
+        If configmap_id is set, it takes precedence and is sanitized.
+        Otherwise, returns "{configmap_prefix}-{name}".
+        """
+        if self.configmap_id:
+            return f"{self.configmap_prefix}-{sanitize_kubernetes_name(self.configmap_id)}"
+        return f"{self.configmap_prefix}-{name}"
+
     def _find_files_to_package(self, base_path: Path) -> List[Path]:
         """
         Find files to package based on include_pattern and relative_path.
@@ -198,7 +212,8 @@ class ConfigMapPackager(Packager):
         """
         if self.v1 is None:
             return
-        configmap_name = f"{self.configmap_prefix}-{name}"
+        # Use the same resolution logic as in package()
+        configmap_name = self.resolve_configmap_name(name)
         try:
             self.v1.delete_namespaced_config_map(name=configmap_name, namespace=self.namespace)
             logger.info(f"Cleaned up ConfigMap: {configmap_name}")

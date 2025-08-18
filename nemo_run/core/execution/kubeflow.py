@@ -13,23 +13,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
+import yaml
 from kubeflow.trainer.api.trainer_client import TrainerClient
-from kubeflow.trainer.types.types import CustomTrainer, Runtime
+from kubeflow.trainer.types.types import (
+    CustomTrainer,
+    Runtime,
+)
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
 
 from nemo_run.config import Partial, Script
-from nemo_run.core.execution.base import Executor
+from nemo_run.core.execution.base import Executor, ExecutorMacros
+from nemo_run.core.execution.utils import fill_template
 from nemo_run.core.packaging.base import sanitize_kubernetes_name
 from nemo_run.core.packaging.configmap import ConfigMapPackager
 
 logger = logging.getLogger(__name__)
+
+
+def _nemo_inline_entry_params(params: dict):
+    """Execute inline Script content using the SDK's func_args injection style.
+
+    The SDK injects a single positional dict when func_args is provided; this
+    function unpacks the dict and executes the content via bash or python.
+    """
+    if not isinstance(params, dict):
+        raise ValueError("Expected params to be a dict with keys 'script' and 'entrypoint'.")
+
+    script = params.get("script", "")
+    entrypoint = params.get("entrypoint", "bash")
+
+    # Self-contained to work when injected by the SDK: include imports here
+    import subprocess as _sp
+    import textwrap as _tw
+
+    script = _tw.dedent(script)
+    if "python" in entrypoint:
+        exec(script, {})
+        return
+    _sp.run(["bash", "-lc", script], check=True)
 
 
 @dataclass(kw_only=True)
@@ -80,10 +109,13 @@ class KubeflowExecutor(Executor):
     gpus: Optional[int] = None
 
     #: Container image for training jobs
-    image: str = "nvcr.io/nvidia/pytorch:23.12-py3"
+    image: str = "nvcr.io/nvidia/nemo:dev"
 
     #: Name of the ClusterTrainingRuntime to use
     runtime_name: str = "torch-distributed-nemo"
+
+    #: Reusable runtime identifier (optional)
+    runtime_id: Optional[str] = None
 
     #: Volume mount path for staged files (default: /workspace)
     volume_mount_path: str = "/workspace"
@@ -92,13 +124,22 @@ class KubeflowExecutor(Executor):
     default_task_dir: str = "task-dir"
 
     #: TrainerClient instance for managing TrainJob objects
-    _trainer_client: Optional[TrainerClient] = None
+    _trainer_client: Optional[TrainerClient] = field(init=False, repr=False, default=None)
 
     #: Job name (set from task_id during assign)
     job_name: str = field(init=False, default="")
 
     #: Current task being executed (set by Experiment API)
     _current_task: Optional[Union[Script, Partial]] = None
+
+    #: Kubernetes connectivity status
+    _kubernetes_available: bool = field(init=False, default=False)
+
+    #: Detach mode flag (set by experiment framework)
+    _detach_mode: bool = field(init=False, default=False)
+
+    #: Cached runtime name to avoid recreating ClusterTrainingRuntime
+    _cached_runtime_name: Optional[str] = field(init=False, default=None)
 
     def __post_init__(self):
         """Validate executor configuration and setup Kubernetes access."""
@@ -151,6 +192,11 @@ class KubeflowExecutor(Executor):
         self.job_dir = os.path.join(exp_dir, task_dir)
         self.job_name = task_id
 
+    def set_detach_mode(self, detach: bool):
+        """Set detach mode for the executor."""
+        self._detach_mode = detach
+        logger.info(f"KubeflowExecutor detach mode set to: {detach}")
+
     def nnodes(self) -> int:
         """Return the number of nodes for distributed training."""
         return self.nodes
@@ -159,26 +205,86 @@ class KubeflowExecutor(Executor):
         """Return the number of processes per node."""
         return self.ntasks_per_node
 
+    def macro_values(self) -> Optional[ExecutorMacros]:
+        return None
+
+    def get_launcher_prefix(self) -> Optional[list[str]]:
+        """Get launcher prefix for profiling if enabled."""
+        launcher = self.get_launcher()
+        if launcher and hasattr(launcher, "nsys_profile") and launcher.nsys_profile:
+            os.makedirs(os.path.join(self.job_dir, launcher.nsys_folder), exist_ok=True)
+            return launcher.get_nsys_prefix(profile_dir=self.job_dir)
+        return None
+
+    def get_nsys_entrypoint(self) -> str:
+        """Get nsys entrypoint for profiling."""
+        return "nsys"
+
+    def supports_launcher_transform(self) -> bool:
+        """Return whether this executor supports launcher transforms."""
+        return False
+
+    def package_configs(self, *cfgs: tuple[str, str]) -> list[str]:
+        """Package configuration files for the job."""
+        filenames = []
+        basepath = os.path.join(self.job_dir, "configs")
+        os.makedirs(basepath, exist_ok=True)
+        for name, cfg in cfgs:
+            filename = os.path.join(basepath, name)
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename, "w") as f:
+                f.write(cfg)
+            filenames.append(filename)
+        return filenames
+
+    def create_job_dir(self):
+        """Create the job directory."""
+        os.makedirs(self.job_dir, exist_ok=True)
+
     def _get_trainer_client(self) -> TrainerClient:
         """Get or create a TrainerClient instance."""
         if self._trainer_client is None:
-            self._trainer_client = TrainerClient()
+            # Initialize client with the executor's namespace
+            self._trainer_client = TrainerClient(namespace=self.namespace)
         return self._trainer_client
 
-    def _get_runtime(self) -> Runtime:
-        """Get the Runtime configuration for the training job."""
-        # Create experiment-specific ClusterTrainingRuntime
-        runtime_name = self._create_cluster_training_runtime()
-        return Runtime(
-            name=runtime_name,
-        )
+    def _get_runtime(self, trainer=None) -> Runtime:
+        """Get the Runtime configuration for the training job.
 
-    def _create_cluster_training_runtime(self) -> str:
-        """Create a ClusterTrainingRuntime with experiment-specific configurations."""
+        Resolve or create the ClusterTrainingRuntime name and fetch
+        the Runtime details via the SDK (so trainer entrypoint is set).
+        """
+        runtime_name = self._get_or_create_cluster_training_runtime()
+        client = self._get_trainer_client()
+        return client.get_runtime(runtime_name)
+
+    def _get_executor_config_hash(self) -> str:
+        """Generate a hash based on executor configuration for reusable runtime naming."""
+        # Create a configuration string that determines runtime behavior
+        config_str = f"{self.nodes}-{self.ntasks_per_node}-{self.cpu_limit}-{self.memory_limit}-{self.gpus}-{self.image}-{self.volume_mount_path}"
+
+        # Generate a hash of the configuration
+        return hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+    def _get_or_create_cluster_training_runtime(self) -> str:
+        """Get or create a reusable ClusterTrainingRuntime based on executor configuration."""
         try:
-            # Generate experiment-specific runtime name
-            sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
-            runtime_name = f"nemo-{sanitized_experiment_id}"
+            # Use cached runtime name if available
+            if self._cached_runtime_name:
+                logger.info(f"Using cached runtime name: {self._cached_runtime_name}")
+                return self._cached_runtime_name
+
+            # Use explicit name if provided, otherwise generate based on config
+            if self.runtime_id:
+                runtime_name = f"nemo-runtime-{self.runtime_id}"
+                logger.info(f"Using explicit runtime name: {runtime_name}")
+            else:
+                # Generate runtime name based on executor configuration (not experiment-specific)
+                # This makes the runtime reusable across experiments with same configuration
+                config_hash = self._get_executor_config_hash()
+                runtime_name = f"nemo-runtime-{config_hash}"
+                logger.info(f"Generated config hash: {config_hash}")
+                logger.info(f"Generated runtime name: {runtime_name}")
 
             # Check if Kubernetes is available
             if not hasattr(self, "_kubernetes_available") or not self._kubernetes_available:
@@ -188,53 +294,79 @@ class KubeflowExecutor(Executor):
             # Create Kubernetes API client
             api_client = client.CustomObjectsApi()
 
-            # Define ClusterTrainingRuntime CRD
-            runtime_body = {
-                "apiVersion": "training.kubeflow.org/v1",
-                "kind": "ClusterTrainingRuntime",
-                "metadata": {"name": runtime_name, "namespace": self.namespace},
-                "spec": {
-                    "containerSpec": {
-                        "image": self.image,
-                        "resources": {"requests": {}, "limits": {}},
-                    },
-                    "nodeSelector": {},
-                    "tolerations": [],
-                    "affinity": {},
-                },
-            }
+            # Check if the runtime already exists
+            try:
+                api_client.get_cluster_custom_object(
+                    group="trainer.kubeflow.org",
+                    version="v1alpha1",
+                    plural="clustertrainingruntimes",
+                    name=runtime_name,
+                )
+                logger.info(f"ClusterTrainingRuntime {runtime_name} already exists, reusing")
+                self._cached_runtime_name = runtime_name
+                return runtime_name
+            except ApiException as e:
+                if e.status == 404:  # Not found, create it
+                    logger.info(
+                        f"ClusterTrainingRuntime {runtime_name} not found, creating new one"
+                    )
+                else:
+                    logger.warning(f"Error checking ClusterTrainingRuntime {runtime_name}: {e}")
+                    return self.runtime_name
 
-            # Add resource configuration
-            if self.cpu_limit:
-                runtime_body["spec"]["containerSpec"]["resources"]["limits"]["cpu"] = self.cpu_limit
-            if self.memory_limit:
-                runtime_body["spec"]["containerSpec"]["resources"]["limits"]["memory"] = (
-                    self.memory_limit
+            # Define ClusterTrainingRuntime CRD via Jinja template
+            # Compute names once using centralized helpers
+            configmap_name = (
+                self.packager.resolve_configmap_name(
+                    self._get_configmap_name(self.default_task_dir)
                 )
-            if self.gpus:
-                runtime_body["spec"]["containerSpec"]["resources"]["limits"]["nvidia.com/gpu"] = (
-                    str(self.gpus)
-                )
+                if isinstance(self.packager, ConfigMapPackager)
+                else self._get_configmap_name(self.default_task_dir)
+            )
+
+            template_vars = {
+                "runtime_name": runtime_name,
+                "namespace": self.namespace,
+                "nodes": self.nodes,
+                "image": self.image,
+                "volume_mount_path": self.volume_mount_path,
+                "configmap_name": configmap_name,
+                "cpu_limit": self.cpu_limit,
+                "memory_limit": self.memory_limit,
+                "gpus": self.gpus,
+            }
+            rendered = fill_template(
+                template_name="kubeflow_clustertrainingruntime.yaml.j2",
+                variables=template_vars,
+            )
+            runtime_body = yaml.safe_load(rendered)
 
             # Create the ClusterTrainingRuntime
             try:
                 api_client.create_cluster_custom_object(
-                    group="training.kubeflow.org",
-                    version="v1",
+                    group="trainer.kubeflow.org",
+                    version="v1alpha1",
                     plural="clustertrainingruntimes",
                     body=runtime_body,
                 )
-                logger.info(f"Created ClusterTrainingRuntime: {runtime_name}")
+                logger.info(f"Created reusable ClusterTrainingRuntime: {runtime_name}")
                 logger.info(f"  - Nodes: {self.nodes}")
                 logger.info(f"  - GPUs per node: {self.gpus or 'default'}")
                 logger.info(f"  - CPU limits: {self.cpu_limit or 'default'}")
                 logger.info(f"  - Memory limits: {self.memory_limit or 'default'}")
                 logger.info(f"  - Namespace: {self.namespace}")
+                logger.info(
+                    "  - This runtime can be reused for experiments with same configuration"
+                )
+                self._cached_runtime_name = runtime_name
                 return runtime_name
 
             except ApiException as e:
-                if e.status == 409:  # Already exists
-                    logger.info(f"ClusterTrainingRuntime {runtime_name} already exists")
+                if e.status == 409:  # Already exists (race condition)
+                    logger.info(
+                        f"ClusterTrainingRuntime {runtime_name} already exists (race condition)"
+                    )
+                    self._cached_runtime_name = runtime_name
                     return runtime_name
                 else:
                     logger.error(f"Failed to create ClusterTrainingRuntime: {e}")
@@ -248,32 +380,24 @@ class KubeflowExecutor(Executor):
     def _delete_cluster_training_runtime(self, runtime_name: str):
         """Delete a ClusterTrainingRuntime."""
         try:
-            # Check if Kubernetes is available
             if not hasattr(self, "_kubernetes_available") or not self._kubernetes_available:
-                logger.warning("Kubernetes not available, skipping runtime deletion")
+                logger.warning("Kubernetes not available, skipping ClusterTrainingRuntime deletion")
                 return
 
-            # Create Kubernetes API client
             api_client = client.CustomObjectsApi()
+            api_client.delete_cluster_custom_object(
+                group="trainer.kubeflow.org",
+                version="v1alpha1",
+                plural="clustertrainingruntimes",
+                name=runtime_name,
+            )
+            logger.info(f"Deleted ClusterTrainingRuntime: {runtime_name}")
 
-            # Delete the ClusterTrainingRuntime
-            try:
-                api_client.delete_cluster_custom_object(
-                    group="training.kubeflow.org",
-                    version="v1",
-                    plural="clustertrainingruntimes",
-                    name=runtime_name,
-                )
-                logger.info(f"Deleted ClusterTrainingRuntime: {runtime_name}")
-
-            except ApiException as e:
-                if e.status == 404:  # Not found
-                    logger.info(
-                        f"ClusterTrainingRuntime {runtime_name} not found (already deleted)"
-                    )
-                else:
-                    logger.error(f"Failed to delete ClusterTrainingRuntime {runtime_name}: {e}")
-
+        except ApiException as e:
+            if e.status == 404:  # Not found
+                logger.info(f"ClusterTrainingRuntime {runtime_name} not found, skipping deletion")
+            else:
+                logger.error(f"Failed to delete ClusterTrainingRuntime {runtime_name}: {e}")
         except Exception as e:
             logger.error(f"Failed to delete ClusterTrainingRuntime {runtime_name}: {e}")
 
@@ -296,8 +420,14 @@ class KubeflowExecutor(Executor):
         trainer_kwargs["resources_per_node"] = resources_per_node
 
         # Handle task from Experiment API
-        if hasattr(task, "inline") and task.inline:  # Script object
-            trainer_kwargs["python_file"] = task.inline
+        if hasattr(task, "inline") and task.inline:  # Script object (inline)
+            # Pass an inline entry function + args to SDK; SDK embeds code into container command
+            # Use the wrapper that accepts a single parameters dict, matching SDK injection style
+            trainer_kwargs["func"] = _nemo_inline_entry_params
+            trainer_kwargs["func_args"] = {
+                "script": task.inline,
+                "entrypoint": getattr(task, "entrypoint", "bash"),
+            }
         elif hasattr(task, "__fn_or_cls__"):  # Partial object
             trainer_kwargs["func"] = task.__fn_or_cls__
         else:
@@ -306,53 +436,27 @@ class KubeflowExecutor(Executor):
         return CustomTrainer(**trainer_kwargs)
 
     def _get_staged_file_path(self, filename: str) -> str:
-        """
-        Infer the correct path to a staged file based on how it was staged.
-
-        This method determines the full path to a staged file by:
-        1. Getting the expected file path from the ConfigMapPackager
-        2. Using the volume mount path from the ClusterTrainingRuntime
-
-        Args:
-            filename: The filename to resolve (e.g., "mistral.py")
-
-        Returns:
-            The full path to the staged file in the container
-        """
-        # Get the task directory from job_dir if available
-        task_dir = self.default_task_dir  # Use the configurable default
-        if hasattr(self, "job_dir") and self.job_dir:
-            task_dir = os.path.basename(self.job_dir)
-
-        # Determine the file path based on the packager
+        """Get the staged file path for a given filename."""
         if isinstance(self.packager, ConfigMapPackager):
-            # Get the expected file path from the ConfigMapPackager
-            full_path = self.packager.get_container_file_path(
-                task_dir, filename, self.volume_mount_path
+            # Map to the key format used in ConfigMapPackager: "{job_dir}/{rel_path}" with slashes as dashes
+            effective_dir = (
+                Path(self.job_dir).name if getattr(self, "job_dir", "") else self.default_task_dir
             )
-
-            logger.debug(f"📝 Task dir: {task_dir}")
-            logger.debug(f"📁 Volume mount path: {self.volume_mount_path}")
-            logger.debug(f"🔗 Full path: {full_path}")
-
-            return full_path
+            sanitized_dir = sanitize_kubernetes_name(effective_dir)
+            sanitized_filename = filename.replace("/", "-")
+            return f"{self.volume_mount_path}/{sanitized_dir}-{sanitized_filename}"
         else:
-            # For non-ConfigMapPackager, assume the file is in the working directory
-            logger.warning("Non-ConfigMapPackager used, assuming file is in working directory")
+            # For other packagers, assume file is in working directory
             return filename
 
     def create_trainjob(self, job_name: str, task) -> str:
         """Create a TrainJob using the Kubeflow SDK."""
         try:
             client = self._get_trainer_client()
-            runtime = self._get_runtime()
             trainer = self._get_custom_trainer(task)
+            runtime = self._get_runtime(trainer=trainer)
 
-            # Stage files if using ConfigMapPackager
-            if isinstance(self.packager, ConfigMapPackager):
-                configmap_name = self.stage_files(self.default_task_dir)
-                logger.info(f"Staged files in ConfigMap: {configmap_name}")
-
+            # Ensure the CustomTrainer is passed so that TrainJob.spec.trainer is populated
             job_id = client.train(runtime=runtime, trainer=trainer)
 
             logger.info(f"Created TrainJob: {job_id}")
@@ -390,38 +494,56 @@ class KubeflowExecutor(Executor):
             logger.error(f"Failed to get TrainJob logs: {e}")
             return {}
 
-    def _get_sanitized_configmap_name(self, task_dir: str) -> str:
-        """Get a sanitized ConfigMap name that complies with Kubernetes naming rules."""
-        sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
+    def _get_configmap_name(self, task_dir: str, task=None) -> str:
+        """Get a content-based ConfigMap name suffix for the task directory.
+
+        Prefix and overrides (e.g., configmap_id) are applied by the packager's
+        resolve_configmap_name().
+        """
+        # Use content-based naming (suffix only)
+
+        # Create a content hash based on the task and files
+        content_str = ""
+
+        # Add file patterns from packager
+        if isinstance(self.packager, ConfigMapPackager):
+            if hasattr(self.packager, "include_pattern"):
+                content_str += f"patterns:{str(self.packager.include_pattern)}"
+            if hasattr(self.packager, "relative_path"):
+                content_str += f"path:{str(self.packager.relative_path)}"
+
+        # Add task directory
+        content_str += f"dir:{task_dir}"
+
+        # Generate hash
+        content_hash = hashlib.md5(content_str.encode()).hexdigest()[:8]
+
+        # Create sanitized name
         sanitized_task_dir = sanitize_kubernetes_name(task_dir)
+        return f"nemo-content-{content_hash}-{sanitized_task_dir}"
 
-        # Use the packager's configmap_prefix if available
-        configmap_prefix = getattr(self.packager, "configmap_prefix", "nemo-workspace")
-        if configmap_prefix:
-            return f"{configmap_prefix}-{sanitized_experiment_id}-{sanitized_task_dir}"
-        else:
-            return f"{sanitized_experiment_id}-{sanitized_task_dir}"
+    def _get_sanitized_configmap_name(self, task_dir: str) -> str:
+        """Get a sanitized ConfigMap name for the task directory."""
+        # Use the new ConfigMap naming method
+        return self._get_configmap_name(task_dir)
 
-    def stage_files(self, task_dir: str) -> str:
-        """Stage files using the packager and return the ConfigMap name."""
-        try:
-            configmap_name = self._get_sanitized_configmap_name(task_dir)
-            self.packager.package(
-                path=Path(self.experiment_dir), job_dir=task_dir, name=configmap_name
+    def stage_files(self, task_dir: str, task=None) -> str:
+        """Stage files using the packager."""
+        if isinstance(self.packager, ConfigMapPackager):
+            configmap_name = self._get_configmap_name(task_dir, task)
+            base_path = (
+                Path(self.experiment_dir) if getattr(self, "experiment_dir", "") else Path.cwd()
             )
-            logger.info(f"Staged files in ConfigMap: {configmap_name}")
-            return configmap_name
-        except Exception as e:
-            logger.error(f"Failed to stage files: {e}")
-            raise
+            return self.packager.package(path=base_path, job_dir=task_dir, name=configmap_name)
+        else:
+            # For non-ConfigMap packagers, just return the task_dir
+            return task_dir
 
-    def cleanup_files(self, task_dir: str):
+    def cleanup_files(self, task_dir: str, task=None):
         """Clean up staged files."""
-        try:
-            configmap_name = self._get_sanitized_configmap_name(task_dir)
-            logger.info(f"Files staged in ConfigMap: {configmap_name}")
-        except Exception as e:
-            logger.error(f"Failed to cleanup files: {e}")
+        if isinstance(self.packager, ConfigMapPackager):
+            configmap_name = self._get_configmap_name(task_dir, task)
+            self.packager.cleanup(configmap_name)
 
     def submit(self, task, job_name: str) -> str:
         """
@@ -447,7 +569,7 @@ class KubeflowExecutor(Executor):
         try:
             # Stage files if using ConfigMapPackager
             if isinstance(self.packager, ConfigMapPackager):
-                configmap_name = self.stage_files(self.job_dir.split("/")[-1])
+                configmap_name = self.stage_files(self.default_task_dir, task)
                 logger.info(f"Staged files in ConfigMap: {configmap_name}")
 
             # Create TrainJob using the Kubeflow SDK
@@ -462,15 +584,15 @@ class KubeflowExecutor(Executor):
 
     def monitor(self, job_id: str) -> str:
         """
-        Monitor the status of a submitted job.
+        Monitor the status of a job.
 
-        This method is called by the Experiment API to check job status.
+        This method is called by the Experiment API to monitor job status.
 
         Args:
             job_id: The ID of the job to monitor
 
         Returns:
-            The current status of the job (Running, Completed, Failed, etc.)
+            The current status of the job
 
         Raises:
             RuntimeError: If executor is not assigned to an experiment
@@ -491,32 +613,19 @@ class KubeflowExecutor(Executor):
         """
         Clean up resources associated with a job.
 
-        This method is called by the Experiment API to clean up job resources.
-        It handles TrainJob deletion, file cleanup, and ClusterTrainingRuntime cleanup.
-
-        Args:
-            handle: The ID of the job to clean up
-
-        Raises:
-            RuntimeError: If executor is not assigned to an experiment
+        For Kubeflow (non-TorchX), align behavior with Lepton/DGXCloud: do not
+        cancel/delete running jobs on experiment close, regardless of detach mode.
+        Any job lifecycle management should be explicit (via CLI or API), not implicit.
         """
         if not hasattr(self, "experiment_id") or not self.experiment_id:
             raise RuntimeError("Executor not assigned to experiment")
 
         try:
-            # Delete the TrainJob
-            self.delete_trainjob(handle)
-
-            # Clean up staged files
-            task_dir = self.job_dir.split("/")[-1] if self.job_dir else self.default_task_dir
-            self.cleanup_files(task_dir)
-
-            # Clean up ClusterTrainingRuntime
-            sanitized_experiment_id = sanitize_kubernetes_name(self.experiment_id or "experiment")
-            runtime_name = f"nemo-{sanitized_experiment_id}"
-            self._delete_cluster_training_runtime(runtime_name)
-
-            logger.info(f"Cleaned up job {handle}")
+            # Keep jobs running; do not delete TrainJob or runtime/configmap automatically
+            logger.info(
+                "KubeflowExecutor.cleanup: not deleting job or runtime; align with non-TorchX executors (Lepton/DGXCloud)"
+            )
+            return
 
         except Exception as e:
             logger.error(f"Failed to cleanup job {handle}: {e}")
