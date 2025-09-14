@@ -7,49 +7,60 @@ metadata:
     trainer.kubeflow.org/framework: torch
 spec:
   mlPolicy:
-    numNodes: {{ nodes }}
+    numNodes: 1
     torch:
       numProcPerNode: "auto"
   template:
     spec:
       replicatedJobs:
         - name: node
-          replicas: {{ nodes }}
+          replicas: 1
           template:
             metadata:
               labels:
                 trainer.kubeflow.org/trainjob-ancestor-step: trainer
-            {% if enable_tcpxo %}
-            annotations:
-              devices.gke.io/container.tcpxo-daemon: |
-                - path: /dev/nvidia0
-                - path: /dev/nvidia1
-                - path: /dev/nvidia2
-                - path: /dev/nvidia3
-                - path: /dev/nvidia4
-                - path: /dev/nvidia5
-                - path: /dev/nvidia6
-                - path: /dev/nvidia7
-                - path: /dev/nvidiactl
-                - path: /dev/nvidia-uvm
-                - path: /dev/dmabuf_import_helper
-              networking.gke.io/default-interface: eth0
-              networking.gke.io/interfaces: |
-                [
-                  {"interfaceName":"eth0","network":"default"},
-                  {"interfaceName":"eth1","network":"vpc1"},
-                  {"interfaceName":"eth2","network":"vpc2"},
-                  {"interfaceName":"eth3","network":"vpc3"},
-                  {"interfaceName":"eth4","network":"vpc4"},
-                  {"interfaceName":"eth5","network":"vpc5"},
-                  {"interfaceName":"eth6","network":"vpc6"},
-                  {"interfaceName":"eth7","network":"vpc7"},
-                  {"interfaceName":"eth8","network":"vpc8"}
-                ]
-            {% endif %}
             spec:
               template:
+                metadata:
+                  {% if enable_tcpxo %}
+                  annotations:
+                    devices.gke.io/container.tcpxo-daemon: |
+                      - path: /dev/nvidia0
+                      - path: /dev/nvidia1
+                      - path: /dev/nvidia2
+                      - path: /dev/nvidia3
+                      - path: /dev/nvidia4
+                      - path: /dev/nvidia5
+                      - path: /dev/nvidia6
+                      - path: /dev/nvidia7
+                      - path: /dev/nvidiactl
+                      - path: /dev/nvidia-uvm
+                      - path: /dev/dmabuf_import_helper
+                    networking.gke.io/default-interface: eth0
+                    networking.gke.io/interfaces: |
+                      [
+                        {"interfaceName":"eth0","network":"default"},
+                        {"interfaceName":"eth1","network":"vpc1"},
+                        {"interfaceName":"eth2","network":"vpc2"},
+                        {"interfaceName":"eth3","network":"vpc3"},
+                        {"interfaceName":"eth4","network":"vpc4"},
+                        {"interfaceName":"eth5","network":"vpc5"},
+                        {"interfaceName":"eth6","network":"vpc6"},
+                        {"interfaceName":"eth7","network":"vpc7"},
+                        {"interfaceName":"eth8","network":"vpc8"}
+                      ]
+                  {% endif %}
                 spec:
+                  affinity:
+                    podAntiAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        - labelSelector:
+                            matchExpressions:
+                              - key: jobset.sigs.k8s.io/replicatedjob-name
+                                operator: In
+                                values:
+                                  - node
+                          topologyKey: kubernetes.io/hostname
                   volumes:
                     - name: workspace
                       configMap:
