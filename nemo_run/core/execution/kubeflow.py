@@ -328,6 +328,9 @@ class KubeflowExecutor(Executor):
                 content = task.inline
 
             if content:
+                # If bash entrypoint, mutate torchrun flags in script content
+                if re.search(r"(^|/)?bash$", (entrypoint or "bash").strip(), re.IGNORECASE):
+                    content = self._mutate_bash_torchrun_flags(content)
                 files_to_stage[self.training_entry] = (content, entrypoint)
                 logger.info("Script task - will stage content in ConfigMap")
 
@@ -390,23 +393,8 @@ class KubeflowExecutor(Executor):
         if self.gpus is not None:
             resources_per_node["nvidia.com/gpu"] = str(self.gpus)
 
-        # Determine command/args based on entrypoint
-        entrypoint = getattr(task, "entrypoint", "bash") or "bash"
-        mounted_path = f"{self.volume_mount_path}/{self.training_entry}"
-
-        command: list[str]
-        args: list[str]
-        ep_lower = entrypoint.lower()
-        if "bash" in ep_lower:
-            command = ["/bin/bash"]
-            args = ["-c", mounted_path]
-        elif "python" in ep_lower:
-            command = ["python"]
-            args = [mounted_path]
-        else:
-            # Fallback: treat entrypoint as executable to run the staged file
-            command = [entrypoint]
-            args = [mounted_path]
+        # Determine command and args from task/entrypoint
+        command, args = self._build_command_and_args(task)
 
         trainer = CommandTrainer(
             command=command,
@@ -421,6 +409,84 @@ class KubeflowExecutor(Executor):
         )
 
         return trainer
+
+    def _build_command_and_args(self, task) -> tuple[list[str], list[str]]:
+        """Compute command and args for CommandTrainer based on task entrypoint.
+
+        Rules:
+        - Always run the mounted training entry path (volume_mount_path/training_entry)
+        - If entrypoint is python → wrap with torchrun and PET-derived flags
+        - If entrypoint is bash → run the staged script directly via bash -c
+        - Otherwise → run the specified entrypoint as executable with the staged file
+        """
+        mounted_path = f"{self.volume_mount_path}/{self.training_entry}"
+        entrypoint = (getattr(task, "entrypoint", "bash") or "bash").strip()
+        is_python = bool(re.search(r"(^|/)?python(\d+(\.\d+)*)?$", entrypoint, re.IGNORECASE))
+        is_bash = bool(re.search(r"(^|/)?bash$", entrypoint, re.IGNORECASE))
+
+        if is_python:
+            torchrun_flags = (
+                "--nnodes ${PET_NNODES:-1} "
+                "--nproc_per_node ${PET_NPROC_PER_NODE:-auto} "
+                "--rdzv_backend c10d "
+                "--rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}"
+            )
+            return ["/bin/bash"], ["-c", f"torchrun {torchrun_flags} {mounted_path}"]
+        if is_bash:
+            return ["/bin/bash"], ["-c", mounted_path]
+        return [entrypoint], [mounted_path]
+
+    def _mutate_bash_torchrun_flags(self, script_text: str) -> str:
+        """Append missing torchrun rendezvous flags using PET env vars in bash scripts.
+
+        - Detect torchrun invocations (ignoring commented lines).
+        - If a torchrun line lacks any of the required flags, append them.
+        - Required flags: --nnodes, --nproc_per_node, --rdzv_backend, --rdzv_endpoint
+        - Idempotent: do not duplicate flags that already exist on the same line.
+        """
+        required_flags = {
+            "--nnodes": "--nnodes ${PET_NNODES:-1}",
+            "--nproc_per_node": "--nproc_per_node ${PET_NPROC_PER_NODE:-auto}",
+            "--rdzv_backend": "--rdzv_backend c10d",
+            "--rdzv_endpoint": "--rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}",
+        }
+
+        lines = script_text.splitlines()
+        out_lines: list[str] = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                out_lines.append(line)
+                continue
+            # naive detection of torchrun presence on the line
+            if re.search(r"(^|\s)torchrun(\s|$)", stripped):
+                # Determine which flags are missing on this line
+                missing: list[str] = []
+                for key, flag in required_flags.items():
+                    if re.search(rf"\s{re.escape(key)}(\s|$)", stripped) is None:
+                        missing.append(flag)
+                if missing:
+                    missing_str = f" {' '.join(missing)}"
+                    # Find earliest control operator or inline comment to insert before
+                    # Consider: &&, ||, ;, | and inline comment starting with ' #'
+                    control_match = re.search(r"(&&|\|\||;|\|)", line)
+                    comment_pos = line.find(" #")
+                    insert_pos = None
+                    if control_match:
+                        insert_pos = control_match.start()
+                    if comment_pos != -1 and (insert_pos is None or comment_pos < insert_pos):
+                        insert_pos = comment_pos
+
+                    if insert_pos is not None:
+                        new_line = f"{line[:insert_pos]}{missing_str}{line[insert_pos:]}"
+                    else:
+                        new_line = f"{line}{missing_str}"
+                    out_lines.append(new_line)
+                else:
+                    out_lines.append(line)
+            else:
+                out_lines.append(line)
+        return "\n".join(out_lines)
 
     def create_trainjob(self, job_name: str, task, runtime_name: str) -> str:
         """Create a TrainJob using the Kubeflow SDK."""

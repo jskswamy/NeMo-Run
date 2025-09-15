@@ -495,3 +495,166 @@ def test_kubeflow_executor_macro_values():
     result = executor.macro_values()
 
     assert result is None
+
+
+def test_kubeflow_executor_injects_torchrun_for_script():
+    """Script tasks should run under torchrun with PET-derived rendezvous flags."""
+    executor = KubeflowExecutor(nodes=2, ntasks_per_node=8)
+    executor.packager = ConfigMapPackager()
+    # Simulate assignment to set experiment fields
+    executor.assign("exp-abc123", "/tmp/exp", "task-1", "task_dir")
+
+    script_task = Script(inline="python mistral.py")
+
+    with patch("nemo_run.core.execution.kubeflow.CommandTrainer") as mock_trainer:
+        instance = MagicMock()
+        mock_trainer.return_value = instance
+
+        result = executor._get_custom_trainer(script_task)
+
+        assert result == instance
+        mock_trainer.assert_called_once()
+
+        kwargs = mock_trainer.call_args[1]
+        # Always use bash -c with torchrun and PET-derived flags
+        assert kwargs["command"] == ["/bin/bash"]
+        args_list = kwargs.get("args")
+        assert isinstance(args_list, list) and len(args_list) >= 2
+        assert args_list[0] == "-c"
+        args_joined = " ".join(args_list)
+        assert "torchrun" in args_joined
+        assert "--nnodes ${PET_NNODES:-1}" in args_joined
+        assert "--nproc_per_node ${PET_NPROC_PER_NODE:-auto}" in args_joined
+        assert "--rdzv_backend c10d" in args_joined
+        assert (
+            "--rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}" in args_joined
+        )
+        # Mounted script path
+        mounted_path = f"{executor.volume_mount_path}/{executor.training_entry}"
+        assert mounted_path in args_joined
+
+
+def test_bash_script_torchrun_flags_injected_all_missing():
+    executor = KubeflowExecutor()
+    script = """
+    #!/bin/bash
+    set -e
+    torchrun train.py --epochs 2
+    """.strip()
+
+    mutated = executor._mutate_bash_torchrun_flags(script)
+    expected = """
+    #!/bin/bash
+    set -e
+    torchrun train.py --epochs 2 --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
+    """.strip()
+    assert mutated == expected
+
+
+def test_bash_script_torchrun_flags_injected_partial_missing():
+    executor = KubeflowExecutor()
+    script = """
+    #!/bin/bash
+    torchrun --nnodes 2 --rdzv_backend c10d train.py
+    """.strip()
+
+    mutated = executor._mutate_bash_torchrun_flags(script)
+    expected = """
+    #!/bin/bash
+    torchrun --nnodes 2 --rdzv_backend c10d train.py --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
+    """.strip()
+    assert mutated == expected
+
+
+def test_bash_script_without_torchrun_unchanged():
+    executor = KubeflowExecutor()
+    script = """
+    #!/bin/bash
+    echo "hello"
+    python app.py
+    """.strip()
+    mutated = executor._mutate_bash_torchrun_flags(script)
+    assert mutated == script
+
+
+def test_bash_script_torchrun_multiline_missing_flags():
+    executor = KubeflowExecutor()
+    script = """
+    #!/bin/bash
+    set -e
+    torchrun \
+      --nnodes 2 \
+      train.py
+    """.strip()
+
+    mutated = executor._mutate_bash_torchrun_flags(script)
+    # Note: current mutator appends flags to the line with 'torchrun \' (after the backslash)
+    expected = """
+    #!/bin/bash
+    set -e
+    torchrun \
+      --nnodes 2 \
+      train.py --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
+    """.strip()
+    assert mutated == expected
+
+
+def test_bash_script_torchrun_multiline_complete_unchanged():
+    executor = KubeflowExecutor()
+    script = """
+    #!/bin/bash
+    torchrun \
+      --nnodes ${PET_NNODES:-1} \
+      --nproc_per_node ${PET_NPROC_PER_NODE:-auto} \
+      --rdzv_backend c10d \
+      --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500} \
+      train.py
+    """.strip()
+
+    mutated = executor._mutate_bash_torchrun_flags(script)
+    assert mutated == script
+
+
+class TestBashTorchrunMutation:
+    def test_torchrun_with_and_echo(self):
+        executor = KubeflowExecutor()
+        script = """
+        #!/bin/bash
+        torchrun train.py && echo done
+        """.strip()
+        mutated = executor._mutate_bash_torchrun_flags(script)
+        expected = """
+        #!/bin/bash
+        torchrun train.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500} && echo done
+        """.strip()
+        assert mutated == expected
+
+    def test_torchrun_with_semicolon_python(self):
+        executor = KubeflowExecutor()
+        script = """
+        #!/bin/bash
+        torchrun train.py; python other.py
+        """.strip()
+        mutated = executor._mutate_bash_torchrun_flags(script)
+        expected = """
+        #!/bin/bash
+        torchrun train.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}; python other.py
+        """.strip()
+        assert mutated == expected
+
+    def test_multiple_torchrun_invocations(self):
+        executor = KubeflowExecutor()
+        script = """
+        #!/bin/bash
+        torchrun job1.py
+        echo middle
+        torchrun job2.py
+        """.strip()
+        mutated = executor._mutate_bash_torchrun_flags(script)
+        expected = """
+        #!/bin/bash
+        torchrun job1.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
+        echo middle
+        torchrun job2.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
+        """.strip()
+        assert mutated == expected
