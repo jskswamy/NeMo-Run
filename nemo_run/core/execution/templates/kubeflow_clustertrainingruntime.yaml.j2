@@ -89,43 +89,12 @@ spec:
                       emptyDir:
                         medium: Memory
                         sizeLimit: 2048Gi
-                  containers:
-                    - name: node
-                      image: {{ image }}
-                      env:
-                        - name: LD_LIBRARY_PATH
-                          value: /usr/local/nvidia/lib64
-                        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
-                          value: /dev/aperture_devices
-                      volumeMounts:
-                        - name: workspace
-                          mountPath: {{ volume_mount_path }}
-                        {% if storage_pvc_mounts %}
-                        {% for pvc in storage_pvc_mounts %}
-                        - name: {{ pvc.name }}
-                          mountPath: {{ pvc.mount_path }}
-                          {% if pvc.read_only %}readOnly: true{% endif %}
-                        {% endfor %}
-                        {% endif %}
-                        - name: mistral-checkpoint
-                          mountPath: /workspace
-                        - name: dshm
-                          mountPath: /dev/shm
-                        - name: aperture-devices
-                          mountPath: /dev/aperture_devices
-                      resources:
-                        requests:
-                          {% if cpu_limit %}cpu: {{ cpu_limit }}{% endif %}
-                          {% if memory_limit %}memory: {{ memory_limit }}{% endif %}
-                          {% if gpus %}"nvidia.com/gpu": {{ gpus }}{% endif %}
-                        limits:
-                          {% if cpu_limit %}cpu: {{ cpu_limit }}{% endif %}
-                          {% if memory_limit %}memory: {{ memory_limit }}{% endif %}
-                          {% if gpus %}"nvidia.com/gpu": {{ gpus }}{% endif %}
+                  initContainers:
                     {% if enable_tcpxo %}
                     - name: tcpxo-daemon
                       image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.15
                       imagePullPolicy: Always
+                      restartPolicy: Always
                       command: ["/bin/sh", "-c"]
                       args:
                         - |
@@ -148,3 +117,34 @@ spec:
                         - name: proc-sys
                           mountPath: /hostprocsysfs
                     {% endif %}
+                  containers:
+                    - name: node
+                      image: {{ image }}
+                      env:
+                        - name: LD_LIBRARY_PATH
+                          value: /usr/local/nvidia/lib64
+                        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
+                          value: /dev/aperture_devices
+                      volumeMounts:
+                        - name: workspace
+                          mountPath: {{ volume_mount_path }}
+                        {% if storage_pvc_mounts %}
+                        {% for pvc in storage_pvc_mounts %}
+                        - name: {{ pvc.name }}
+                          mountPath: {{ pvc.mount_path }}
+                          {% if pvc.read_only %}readOnly: true{% endif %}
+                        {% endfor %}
+                        {% endif %}
+                        - name: dshm
+                          mountPath: /dev/shm
+                        - name: aperture-devices
+                          mountPath: /dev/aperture_devices
+                      resources:
+                        requests:
+                          {% if cpu_limit %}cpu: {{ cpu_limit }}{% endif %}
+                          {% if memory_limit %}memory: {{ memory_limit }}{% endif %}
+                          {% if gpus %}"nvidia.com/gpu": {{ gpus }}{% endif %}
+                        limits:
+                          {% if cpu_limit %}cpu: {{ cpu_limit }}{% endif %}
+                          {% if memory_limit %}memory: {{ memory_limit }}{% endif %}
+                          {% if gpus %}"nvidia.com/gpu": {{ gpus }}{% endif %}

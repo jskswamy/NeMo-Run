@@ -323,18 +323,33 @@ def test_kubeflow_executor_get_custom_trainer_inline(executor_kwargs, expected_n
 
 
 def test_kubeflow_executor_get_custom_trainer_function_based():
-    """Partial is not supported yet with CommandTrainer path; expect error."""
+    """Partial is supported: ensure launcher produces torchrun with PET flags."""
 
     def dummy_function():
         return "function result"
 
     partial_task = Partial(dummy_function)
     executor = KubeflowExecutor(nodes=1, gpus=4)
-    # Simulate the assignment process to set the experiment name
+    executor.packager = ConfigMapPackager()
     executor.assign("exp-123", "/tmp/exp", "task-1", "task_dir")
 
-    with pytest.raises(NotImplementedError):
-        _ = executor._get_custom_trainer(partial_task)
+    with patch("nemo_run.core.execution.kubeflow.CommandTrainer") as mock_trainer:
+        instance = MagicMock()
+        mock_trainer.return_value = instance
+
+        result = executor._get_custom_trainer(partial_task)
+
+        assert result == instance
+        mock_trainer.assert_called_once()
+
+        kwargs = mock_trainer.call_args[1]
+        assert kwargs["command"] == ["/bin/bash"]
+        args_joined = " ".join(kwargs.get("args", []))
+        assert "torchrun" in args_joined
+        assert "--nnodes ${PET_NNODES}" in args_joined
+        assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
+        assert "--rdzv_backend c10d" in args_joined
+        assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
 
 
 def test_kubeflow_executor_get_custom_trainer_fallback():
@@ -684,138 +699,96 @@ def test_kubeflow_executor_injects_torchrun_for_script():
         assert args_list[0] == "-c"
         args_joined = " ".join(args_list)
         assert "torchrun" in args_joined
-        assert "--nnodes ${PET_NNODES:-1}" in args_joined
-        assert "--nproc_per_node ${PET_NPROC_PER_NODE:-auto}" in args_joined
+        assert "--nnodes ${PET_NNODES}" in args_joined
+        assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
         assert "--rdzv_backend c10d" in args_joined
-        assert (
-            "--rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}" in args_joined
-        )
+        assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
         # Mounted script path
         mounted_path = f"{executor.volume_mount_path}/{executor.training_entry}"
         assert mounted_path in args_joined
 
 
-def test_bash_script_torchrun_flags_injected_all_missing():
-    executor = KubeflowExecutor()
-    script = """
-    #!/bin/bash
-    set -e
-    torchrun train.py --epochs 2
-    """.strip()
+def test_kubeflow_executor_wraps_bash_script_without_torchrun():
+    executor = KubeflowExecutor(nodes=2, ntasks_per_node=8)
+    executor.packager = ConfigMapPackager()
+    executor.assign("exp-abc123", "/tmp/exp", "task-1", "task_dir")
 
-    mutated = executor._mutate_bash_torchrun_flags(script)
-    expected = """
-    #!/bin/bash
-    set -e
-    torchrun train.py --epochs 2 --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
-    """.strip()
-    assert mutated == expected
+    script_task = Script(entrypoint="bash", inline="#!/bin/bash\necho hello")
 
+    with patch("nemo_run.core.execution.kubeflow.CommandTrainer") as mock_trainer:
+        instance = MagicMock()
+        mock_trainer.return_value = instance
 
-def test_bash_script_torchrun_flags_injected_partial_missing():
-    executor = KubeflowExecutor()
-    script = """
-    #!/bin/bash
-    torchrun --nnodes 2 --rdzv_backend c10d train.py
-    """.strip()
+        result = executor._get_custom_trainer(script_task)
 
-    mutated = executor._mutate_bash_torchrun_flags(script)
-    expected = """
-    #!/bin/bash
-    torchrun --nnodes 2 --rdzv_backend c10d train.py --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
-    """.strip()
-    assert mutated == expected
+        assert result == instance
+        mock_trainer.assert_called_once()
+
+        kwargs = mock_trainer.call_args[1]
+        assert kwargs["command"] == ["/bin/bash"]
+        args_list = kwargs.get("args")
+        assert isinstance(args_list, list) and len(args_list) >= 2
+        assert args_list[0] == "-lc"
+        args_joined = " ".join(args_list)
+        assert "torchrun" in args_joined
+        assert "--nnodes ${PET_NNODES}" in args_joined
+        assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
+        assert "--rdzv_backend c10d" in args_joined
+        assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
 
 
-def test_bash_script_without_torchrun_unchanged():
-    executor = KubeflowExecutor()
-    script = """
-    #!/bin/bash
-    echo "hello"
-    python app.py
-    """.strip()
-    mutated = executor._mutate_bash_torchrun_flags(script)
-    assert mutated == script
+def test_kubeflow_executor_pass_through_bash_with_torchrun():
+    executor = KubeflowExecutor(nodes=2, ntasks_per_node=8)
+    executor.packager = ConfigMapPackager()
+    executor.assign("exp-def456", "/tmp/exp", "task-2", "task_dir")
+
+    script_task = Script(entrypoint="bash", inline="#!/bin/bash\n torchrun train.py")
+
+    with patch("nemo_run.core.execution.kubeflow.CommandTrainer") as mock_trainer:
+        instance = MagicMock()
+        mock_trainer.return_value = instance
+
+        result = executor._get_custom_trainer(script_task)
+
+        assert result == instance
+        mock_trainer.assert_called_once()
+
+        kwargs = mock_trainer.call_args[1]
+        assert kwargs["command"] == ["/bin/bash"]
+        args_list = kwargs.get("args")
+        assert isinstance(args_list, list) and len(args_list) >= 2
+        assert args_list[0] == "-c"
+        args_joined = " ".join(args_list)
+        assert "torchrun --nnodes" not in args_joined
 
 
-def test_bash_script_torchrun_multiline_missing_flags():
-    executor = KubeflowExecutor()
-    script = """
-    #!/bin/bash
-    set -e
-    torchrun \
-      --nnodes 2 \
-      train.py
-    """.strip()
+def test_kubeflow_executor_injects_torchrun_for_partial():
+    """Partial should also run under torchrun using the launcher transform."""
+    executor = KubeflowExecutor(nodes=2, ntasks_per_node=8)
+    executor.packager = ConfigMapPackager()
+    executor.assign("exp-partial", "/tmp/exp", "task-3", "task_dir")
 
-    mutated = executor._mutate_bash_torchrun_flags(script)
-    # Note: current mutator appends flags to the line with 'torchrun \' (after the backslash)
-    expected = """
-    #!/bin/bash
-    set -e
-    torchrun \
-      --nnodes 2 \
-      train.py --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
-    """.strip()
-    assert mutated == expected
+    def _dummy(x, y=2):
+        return x + y
 
+    task = Partial(_dummy, 1, y=3)
 
-def test_bash_script_torchrun_multiline_complete_unchanged():
-    executor = KubeflowExecutor()
-    script = """
-    #!/bin/bash
-    torchrun \
-      --nnodes ${PET_NNODES:-1} \
-      --nproc_per_node ${PET_NPROC_PER_NODE:-auto} \
-      --rdzv_backend c10d \
-      --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500} \
-      train.py
-    """.strip()
+    with patch("nemo_run.core.execution.kubeflow.CommandTrainer") as mock_trainer:
+        instance = MagicMock()
+        mock_trainer.return_value = instance
 
-    mutated = executor._mutate_bash_torchrun_flags(script)
-    assert mutated == script
+        result = executor._get_custom_trainer(task)
 
+        assert result == instance
+        mock_trainer.assert_called_once()
 
-class TestBashTorchrunMutation:
-    def test_torchrun_with_and_echo(self):
-        executor = KubeflowExecutor()
-        script = """
-        #!/bin/bash
-        torchrun train.py && echo done
-        """.strip()
-        mutated = executor._mutate_bash_torchrun_flags(script)
-        expected = """
-        #!/bin/bash
-        torchrun train.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500} && echo done
-        """.strip()
-        assert mutated == expected
-
-    def test_torchrun_with_semicolon_python(self):
-        executor = KubeflowExecutor()
-        script = """
-        #!/bin/bash
-        torchrun train.py; python other.py
-        """.strip()
-        mutated = executor._mutate_bash_torchrun_flags(script)
-        expected = """
-        #!/bin/bash
-        torchrun train.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}; python other.py
-        """.strip()
-        assert mutated == expected
-
-    def test_multiple_torchrun_invocations(self):
-        executor = KubeflowExecutor()
-        script = """
-        #!/bin/bash
-        torchrun job1.py
-        echo middle
-        torchrun job2.py
-        """.strip()
-        mutated = executor._mutate_bash_torchrun_flags(script)
-        expected = """
-        #!/bin/bash
-        torchrun job1.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
-        echo middle
-        torchrun job2.py --nnodes ${PET_NNODES:-1} --nproc_per_node ${PET_NPROC_PER_NODE:-auto} --rdzv_backend c10d --rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}
-        """.strip()
-        assert mutated == expected
+        kwargs = mock_trainer.call_args[1]
+        assert kwargs["command"] == ["/bin/bash"]
+        args_list = kwargs.get("args")
+        assert isinstance(args_list, list) and len(args_list) >= 2
+        args_joined = " ".join(args_list)
+        assert "torchrun" in args_joined
+        assert "--nnodes ${PET_NNODES}" in args_joined
+        assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
+        assert "--rdzv_backend c10d" in args_joined
+        assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined

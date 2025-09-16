@@ -27,11 +27,82 @@ from kubernetes.client.exceptions import ApiException
 
 from nemo_run.config import Partial, Script
 from nemo_run.core.execution.base import Executor, ExecutorMacros
-from nemo_run.core.execution.utils import fill_template
+from nemo_run.core.execution.utils import (
+    fill_template,
+)
 from nemo_run.core.packaging.base import sanitize_kubernetes_name
 from nemo_run.core.packaging.configmap import ConfigMapPackager
 
 logger = logging.getLogger(__name__)
+
+
+def _build_trainer_command(task, mounted_path: str) -> tuple[list[str], list[str]]:
+    """Return (command, args) for CommandTrainer based on task type/content.
+
+    - Partial: treat as python entry
+    - Script: use task.entrypoint/inline if present
+    """
+    entrypoint = getattr(task, "entrypoint", "")
+    inline = getattr(task, "inline", "")
+    is_partial = hasattr(task, "__fn_or_cls__")
+    ep = "python" if is_partial else entrypoint.strip()
+    is_python = is_partial or bool(re.search(r"(^|/)?python(\d+(\.\d+)*)?$", ep, re.IGNORECASE))
+    is_bash = bool(re.search(r"(^|/)?bash$", ep, re.IGNORECASE))
+
+    # Shared PET-derived rendezvous args
+    base_args: list[str] = [
+        "--nnodes",
+        "${PET_NNODES}",
+        "--nproc_per_node",
+        "${PET_NPROC_PER_NODE}",
+        "--rdzv_backend",
+        "c10d",
+        "--rdzv_endpoint",
+        "${PET_MASTER_ADDR}:${PET_MASTER_PORT}",
+    ]
+
+    # Pass-through for bash inline that already includes torchrun
+    if is_bash and re.search(r"(^|\s)torchrun(\s|$)", inline):
+        return [mounted_path], []
+
+    # Build args once; add --no-python for non-python entrypoints
+    args: list[str] = [*base_args]
+    if not is_python:
+        args.append("--no-python")
+    args.append(mounted_path)
+
+    return ["torchrun"], args
+
+
+def _materialize_task_content_for_staging(self, task) -> tuple[str, str]:
+    """Return (content, entrypoint) for staging Script or Partial into ConfigMap."""
+
+    def _read_text(file_path: str) -> str:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    if hasattr(task, "inline") and task.inline:
+        entrypoint = getattr(task, "entrypoint", "bash") or "bash"
+        inline_val = task.inline.strip()
+        if inline_val.startswith("/") and inline_val.endswith(".sh"):
+            local_script_path = inline_val.replace("/nemo_run/scripts/", f"{self.job_dir}/scripts/")
+            if not os.path.exists(local_script_path):
+                raise FileNotFoundError(f"TorchX script file not found: {local_script_path}")
+            return _read_text(local_script_path), entrypoint
+        return inline_val, entrypoint
+
+    if hasattr(task, "__fn_or_cls__"):
+        scripts_dir = os.path.join(self.job_dir, "scripts")
+        os.makedirs(scripts_dir, exist_ok=True)
+        script_filename = os.path.join(scripts_dir, f"{self.training_entry}.sh")
+        if hasattr(task, "to_command"):
+            _ = task.to_command(with_entrypoint=False, filename=script_filename, is_local=True)
+            content = _read_text(script_filename)
+        else:
+            raise ValueError("Cannot stage Partial: task does not support to_command()")
+        return content, "python"
+
+    raise ValueError("Unsupported task type for staging")
 
 
 @dataclass
@@ -401,42 +472,13 @@ class KubeflowExecutor(Executor):
         if task is None:
             return files_to_stage
 
-        if hasattr(task, "inline") and task.inline:
-            # Script task - stage the script content in ConfigMap
-            content: Optional[str] = None
-            entrypoint = getattr(task, "entrypoint", "bash")
-
-            # Check if inline content is a file path (processed by TorchX packaging)
-            if task.inline.strip().startswith("/") and task.inline.strip().endswith(".sh"):
-                # This is a script file path created by TorchX packaging
-                script_path = task.inline.strip()
-                # Convert TorchX path to local path
-                local_script_path = script_path.replace(
-                    "/nemo_run/scripts/", f"{self.job_dir}/scripts/"
-                )
-                if os.path.exists(local_script_path):
-                    with open(local_script_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    logger.info(
-                        f"Read script content from TorchX-generated file: {local_script_path}"
-                    )
-                else:
-                    logger.warning(f"TorchX script file not found, skipping: {local_script_path}")
-                    return files_to_stage
-            else:
-                # Direct inline content
-                content = task.inline
-
-            if content:
-                # If bash entrypoint, mutate torchrun flags in script content
-                if re.search(r"(^|/)?bash$", (entrypoint or "bash").strip(), re.IGNORECASE):
-                    content = self._mutate_bash_torchrun_flags(content)
+        if (hasattr(task, "inline") and task.inline) or hasattr(task, "__fn_or_cls__"):
+            try:
+                content, entrypoint = _materialize_task_content_for_staging(self, task)
                 files_to_stage[self.training_entry] = (content, entrypoint)
-                logger.info("Script task - will stage content in ConfigMap")
-
-        elif hasattr(task, "__fn_or_cls__"):
-            # Partial support not implemented yet for CommandTrainer path
-            logger.warning("Partial tasks are not yet supported with Kubeflow CommandTrainer.")
+                logger.info("Staged task content in ConfigMap")
+            except Exception as e:
+                logger.warning(f"Failed staging task content: {e}")
 
         return files_to_stage
 
@@ -478,12 +520,7 @@ class KubeflowExecutor(Executor):
             self.packager.cleanup(self._get_experiment_identifier())
 
     def _get_custom_trainer(self, task) -> CommandTrainer:
-        """Build a CommandTrainer for a Script task. Partial is not yet supported."""
-        # Reject Partial until implemented
-        if hasattr(task, "__fn_or_cls__"):
-            raise NotImplementedError(
-                "Partial tasks are not yet supported with Kubeflow CommandTrainer"
-            )
+        """Build a CommandTrainer for a Script or Partial task using launcher semantics."""
 
         resources_per_node: dict = {}
         if self.cpu_limit is not None:
@@ -493,8 +530,14 @@ class KubeflowExecutor(Executor):
         if self.gpus is not None:
             resources_per_node["nvidia.com/gpu"] = str(self.gpus)
 
-        # Determine command and args from task/entrypoint
-        command, args = self._build_command_and_args(task)
+        mounted_path = f"{self.volume_mount_path}/{self.training_entry}"
+        if hasattr(task, "__fn_or_cls__"):
+            command, args = _build_launcher_command_and_args("python", "", mounted_path)
+        else:
+            # ToDo: getattr takes care of the default case no need for or "bash"
+            entrypoint = (getattr(task, "entrypoint", "bash") or "bash").strip()
+            inline = (getattr(task, "inline", "") or "").strip()
+            command, args = _build_launcher_command_and_args(entrypoint, inline, mounted_path)
 
         trainer = CommandTrainer(
             command=command,
@@ -509,84 +552,6 @@ class KubeflowExecutor(Executor):
         )
 
         return trainer
-
-    def _build_command_and_args(self, task) -> tuple[list[str], list[str]]:
-        """Compute command and args for CommandTrainer based on task entrypoint.
-
-        Rules:
-        - Always run the mounted training entry path (volume_mount_path/training_entry)
-        - If entrypoint is python → wrap with torchrun and PET-derived flags
-        - If entrypoint is bash → run the staged script directly via bash -c
-        - Otherwise → run the specified entrypoint as executable with the staged file
-        """
-        mounted_path = f"{self.volume_mount_path}/{self.training_entry}"
-        entrypoint = (getattr(task, "entrypoint", "bash") or "bash").strip()
-        is_python = bool(re.search(r"(^|/)?python(\d+(\.\d+)*)?$", entrypoint, re.IGNORECASE))
-        is_bash = bool(re.search(r"(^|/)?bash$", entrypoint, re.IGNORECASE))
-
-        if is_python:
-            torchrun_flags = (
-                "--nnodes ${PET_NNODES:-1} "
-                "--nproc_per_node ${PET_NPROC_PER_NODE:-auto} "
-                "--rdzv_backend c10d "
-                "--rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}"
-            )
-            return ["/bin/bash"], ["-c", f"torchrun {torchrun_flags} {mounted_path}"]
-        if is_bash:
-            return ["/bin/bash"], ["-c", mounted_path]
-        return [entrypoint], [mounted_path]
-
-    def _mutate_bash_torchrun_flags(self, script_text: str) -> str:
-        """Append missing torchrun rendezvous flags using PET env vars in bash scripts.
-
-        - Detect torchrun invocations (ignoring commented lines).
-        - If a torchrun line lacks any of the required flags, append them.
-        - Required flags: --nnodes, --nproc_per_node, --rdzv_backend, --rdzv_endpoint
-        - Idempotent: do not duplicate flags that already exist on the same line.
-        """
-        required_flags = {
-            "--nnodes": "--nnodes ${PET_NNODES:-1}",
-            "--nproc_per_node": "--nproc_per_node ${PET_NPROC_PER_NODE:-auto}",
-            "--rdzv_backend": "--rdzv_backend c10d",
-            "--rdzv_endpoint": "--rdzv_endpoint ${PET_MASTER_ADDR:-localhost}:${PET_MASTER_PORT:-29500}",
-        }
-
-        lines = script_text.splitlines()
-        out_lines: list[str] = []
-        for line in lines:
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
-                out_lines.append(line)
-                continue
-            # naive detection of torchrun presence on the line
-            if re.search(r"(^|\s)torchrun(\s|$)", stripped):
-                # Determine which flags are missing on this line
-                missing: list[str] = []
-                for key, flag in required_flags.items():
-                    if re.search(rf"\s{re.escape(key)}(\s|$)", stripped) is None:
-                        missing.append(flag)
-                if missing:
-                    missing_str = f" {' '.join(missing)}"
-                    # Find earliest control operator or inline comment to insert before
-                    # Consider: &&, ||, ;, | and inline comment starting with ' #'
-                    control_match = re.search(r"(&&|\|\||;|\|)", line)
-                    comment_pos = line.find(" #")
-                    insert_pos = None
-                    if control_match:
-                        insert_pos = control_match.start()
-                    if comment_pos != -1 and (insert_pos is None or comment_pos < insert_pos):
-                        insert_pos = comment_pos
-
-                    if insert_pos is not None:
-                        new_line = f"{line[:insert_pos]}{missing_str}{line[insert_pos:]}"
-                    else:
-                        new_line = f"{line}{missing_str}"
-                    out_lines.append(new_line)
-                else:
-                    out_lines.append(line)
-            else:
-                out_lines.append(line)
-        return "\n".join(out_lines)
 
     def create_trainjob(self, job_name: str, task, runtime_name: str) -> str:
         """Create a TrainJob using the Kubeflow SDK."""
