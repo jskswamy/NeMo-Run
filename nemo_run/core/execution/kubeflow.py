@@ -34,6 +34,49 @@ from nemo_run.core.packaging.configmap import ConfigMapPackager
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class StorageMount:
+    """Generic storage mount configuration.
+
+    kind="pvc" currently supported. Future kinds: hostPath, emptyDir, nfs.
+    """
+
+    mount_path: str
+    read_only: bool = False
+    name: Optional[str] = None
+
+    # PVC-specific
+    pvc_claim_name: Optional[str] = None
+    create_if_missing: bool = False
+    size: Optional[str] = None
+    storage_class: Optional[str] = None
+    access_modes: list[str] = field(default_factory=lambda: ["ReadWriteOnce"])
+    kind: str = "pvc"
+
+    def to_template_fragment(self, index: int) -> dict[str, Any]:
+        vol_name = self.get_volume_name(index)
+        claim_name_sanitized = self.get_pvc_claim_name()
+        if self.kind == "pvc" and self.pvc_claim_name:
+            return {
+                "name": vol_name,
+                "claim_name": claim_name_sanitized,
+                "mount_path": self.mount_path,
+                "read_only": self.read_only,
+            }
+        raise ValueError(f"Unsupported StorageMount config: {self}")
+
+    def get_volume_name(self, index: int) -> str:
+        """Return a DNS-1123 safe volume name, defaulting to pvc-{index}."""
+        base = self.name or f"pvc-{index}"
+        return sanitize_kubernetes_name(base)
+
+    def get_pvc_claim_name(self) -> Optional[str]:
+        """Return a DNS-1123 safe PVC claim name or None if unset."""
+        if not self.pvc_claim_name:
+            return None
+        return sanitize_kubernetes_name(self.pvc_claim_name)
+
+
 @dataclass(kw_only=True)
 class KubeflowExecutor(Executor):
     """
@@ -107,6 +150,8 @@ class KubeflowExecutor(Executor):
 
     #: Enable tcpxo sidecar and related mounts/env in runtime template
     enable_tcpxo: bool = False
+
+    storage_mounts: list["StorageMount"] = field(default_factory=list)
 
     def __post_init__(self):
         """Validate executor configuration and setup Kubernetes access."""
@@ -229,6 +274,9 @@ class KubeflowExecutor(Executor):
             raise RuntimeError("Kubernetes is not available; cannot create ClusterTrainingRuntime")
 
         api_client = client.CustomObjectsApi()
+        # Ensure storage objects exist prior to runtime creation
+        self._ensure_storage()
+
         template_vars = {
             "runtime_name": runtime_name,
             "namespace": self.namespace,
@@ -240,6 +288,7 @@ class KubeflowExecutor(Executor):
             "memory_limit": self.memory_limit,
             "gpus": self.gpus,
             "enable_tcpxo": self.enable_tcpxo,
+            "storage_pvc_mounts": self._get_normalized_storage_mounts(),
         }
         rendered = fill_template(
             template_name="kubeflow_clustertrainingruntime.yaml.j2",
@@ -289,6 +338,57 @@ class KubeflowExecutor(Executor):
                 logger.error(f"Failed to create ClusterTrainingRuntime: {e}")
                 raise
         return runtime_name
+
+    def _ensure_storage(self) -> None:
+        """Create PVCs for storage_mounts with create_if_missing=True."""
+        if not self.storage_mounts:
+            return
+        core_client = client.CoreV1Api()
+        for sm in self.storage_mounts:
+            if sm.kind != "pvc" or not sm.create_if_missing or not sm.pvc_claim_name:
+                continue
+            sanitized_claim = sm.get_pvc_claim_name()
+            try:
+                core_client.read_namespaced_persistent_volume_claim(
+                    name=sanitized_claim, namespace=self.namespace
+                )
+                continue
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(f"PVC check failed for {sm.pvc_claim_name}: {e}")
+                    continue
+            pvc_yaml = fill_template(
+                template_name="kubeflow_pvc.yaml.j2",
+                variables={
+                    "name": sanitized_claim,
+                    "namespace": self.namespace,
+                    "size": sm.size or "100Gi",
+                    "access_modes": sm.access_modes,
+                    "storage_class": sm.storage_class,
+                },
+            )
+            pvc_manifest: Dict[str, Any] = yaml.safe_load(pvc_yaml)
+            try:
+                core_client.create_namespaced_persistent_volume_claim(
+                    namespace=self.namespace, body=pvc_manifest
+                )
+                logger.info(f"Created PVC {sm.pvc_claim_name} in {self.namespace}")
+            except ApiException as e:
+                if e.status == 409:
+                    logger.info(f"PVC {sm.pvc_claim_name} already exists")
+                else:
+                    logger.warning(f"Failed to create PVC {sm.pvc_claim_name}: {e}")
+
+    def _get_normalized_storage_mounts(self) -> list[dict[str, Any]]:
+        """Normalize storage_mounts (currently kind=pvc) to template fragments."""
+        normalized: list[dict[str, Any]] = []
+        for j, sm in enumerate(self.storage_mounts, start=1):
+            try:
+                frag = sm.to_template_fragment(index=j)
+                normalized.append(frag)
+            except Exception:
+                continue
+        return normalized
 
     def _get_additional_files(self, task) -> dict[str, tuple[str, str]]:
         """Get additional files to stage based on task type.

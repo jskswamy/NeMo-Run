@@ -66,9 +66,13 @@ spec:
                       configMap:
                         name: {{ configmap_name }}
                         defaultMode: 0755
-                    - name: mistral-checkpoint
+                    {% if storage_pvc_mounts %}
+                    {% for pvc in storage_pvc_mounts %}
+                    - name: {{ pvc.name }}
                       persistentVolumeClaim:
-                        claimName: mistral-checkpoint
+                        claimName: {{ pvc.claim_name }}
+                    {% endfor %}
+                    {% endif %}
                     - name: libraries
                       hostPath:
                         path: /home/kubernetes/bin/nvidia/lib64
@@ -96,6 +100,13 @@ spec:
                       volumeMounts:
                         - name: workspace
                           mountPath: {{ volume_mount_path }}
+                        {% if storage_pvc_mounts %}
+                        {% for pvc in storage_pvc_mounts %}
+                        - name: {{ pvc.name }}
+                          mountPath: {{ pvc.mount_path }}
+                          {% if pvc.read_only %}readOnly: true{% endif %}
+                        {% endfor %}
+                        {% endif %}
                         - name: mistral-checkpoint
                           mountPath: /workspace
                         - name: dshm

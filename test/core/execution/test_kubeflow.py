@@ -17,13 +17,174 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from kubernetes import config
+from kubernetes.client.exceptions import ApiException
 
 from nemo_run.config import Partial, Script
 from nemo_run.core.execution.kubeflow import (
     KubeflowExecutor,
+    StorageMount,
 )
+from nemo_run.core.execution.utils import fill_template
 from nemo_run.core.packaging.base import Packager
 from nemo_run.core.packaging.configmap import ConfigMapPackager
+
+
+class TestStorageMounts:
+    def test_get_volume_name_defaults_and_sanitizes(self):
+        # Explicit name is sanitized
+        sm_named = StorageMount(
+            mount_path="/mnt/a",
+            name="bad_Name",
+            pvc_claim_name="claim-a",
+        )
+        assert sm_named.get_volume_name(5) == "bad-name"
+
+        # No name -> defaults to pvc-{index}
+        sm_default = StorageMount(
+            mount_path="/mnt/a",
+        )
+        assert sm_default.get_volume_name(3) == "pvc-3"
+
+    def test_get_pvc_claim_name_sanitizes_and_none(self):
+        # Sanitizes underscores to hyphens
+        sm_claim = StorageMount(
+            mount_path="/mnt/a",
+            pvc_claim_name="my_claim",
+        )
+        assert sm_claim.get_pvc_claim_name() == "my-claim"
+
+        # None stays None
+        sm_none = StorageMount(
+            mount_path="/mnt/a",
+        )
+        assert sm_none.get_pvc_claim_name() is None
+
+    def test_storage_mount_name_sanitization(self):
+        executor = KubeflowExecutor()
+        executor.storage_mounts = [
+            StorageMount(
+                mount_path="/mnt/a",
+                read_only=False,
+                name="mistral_checkpoint",
+                pvc_claim_name="claim-a",
+                kind="pvc",
+            )
+        ]
+
+        frags = executor._get_normalized_storage_mounts()
+        assert frags[0]["name"] == "mistral-checkpoint"
+
+    def test_storage_mounts_normalization_to_template(self):
+        executor = KubeflowExecutor()
+        # Create storage mounts
+
+        executor.storage_mounts = [
+            StorageMount(
+                mount_path="/mnt/a",
+                read_only=True,
+                name="data-a",
+                pvc_claim_name="claim-a",
+                kind="pvc",
+            ),
+            StorageMount(
+                mount_path="/mnt/b",
+                read_only=False,
+                pvc_claim_name="claim-b",
+                kind="pvc",
+            ),
+        ]
+
+        frags = executor._get_normalized_storage_mounts()
+        assert len(frags) == 2
+        assert frags[0]["name"] == "data-a"
+        assert frags[0]["claim_name"] == "claim-a"
+        assert frags[0]["mount_path"] == "/mnt/a"
+        assert frags[0]["read_only"] is True
+        assert frags[1]["name"].startswith("pvc-")
+        assert frags[1]["claim_name"] == "claim-b"
+        assert frags[1]["mount_path"] == "/mnt/b"
+        assert frags[1]["read_only"] is False
+
+    def test_crt_template_renders_storage_pvc(self):
+        # Render CRT template directly with storage_pvc_mounts
+
+        rendered = fill_template(
+            template_name="kubeflow_clustertrainingruntime.yaml.j2",
+            variables={
+                "runtime_name": "rt",
+                "namespace": "ns",
+                "nodes": 1,
+                "image": "img",
+                "volume_mount_path": "/src",
+                "configmap_name": "cfg",
+                "cpu_limit": None,
+                "memory_limit": None,
+                "gpus": None,
+                "enable_tcpxo": False,
+                "storage_pvc_mounts": [
+                    {
+                        "name": "data-a",
+                        "claim_name": "claim-a",
+                        "mount_path": "/mnt/a",
+                        "read_only": True,
+                    }
+                ],
+            },
+        )
+
+        assert "persistentVolumeClaim" in rendered
+        assert "claim-a" in rendered
+        assert "mountPath: /mnt/a" in rendered
+        assert "readOnly: true" in rendered
+
+    def test_pvc_creation_when_missing(self, mocker):
+        # Configure an executor with a PVC that should be created
+
+        from nemo_run.core.execution.kubeflow import StorageMount
+
+        executor = KubeflowExecutor(namespace="default")
+        executor.storage_mounts = [
+            StorageMount(
+                mount_path="/mnt/a",
+                pvc_claim_name="claim_a",
+                create_if_missing=True,
+                size="200Gi",
+                storage_class="standard",
+                access_modes=["ReadWriteOnce"],
+            )
+        ]
+
+        mock_core = mocker.patch("kubernetes.client.CoreV1Api")
+        api = mock_core.return_value
+        api.read_namespaced_persistent_volume_claim.side_effect = ApiException(status=404)
+
+        executor._ensure_storage()
+
+        assert api.create_namespaced_persistent_volume_claim.called
+        args, kwargs = api.create_namespaced_persistent_volume_claim.call_args
+        body = kwargs["body"]
+        assert body["metadata"]["name"] == "claim-a"
+        assert body["spec"]["resources"]["requests"]["storage"] == "200Gi"
+        assert body.get("spec", {}).get("storageClassName") == "standard"
+
+    def test_pvc_creation_skipped_when_exists(self, mocker):
+        # Should not call create when PVC exists
+
+        executor = KubeflowExecutor(namespace="default")
+        executor.storage_mounts = [
+            StorageMount(
+                mount_path="/mnt/a",
+                pvc_claim_name="claim_a",
+                create_if_missing=True,
+            )
+        ]
+
+        mock_core = mocker.patch("kubernetes.client.CoreV1Api")
+        api = mock_core.return_value
+        # read succeeds (no exception)
+        executor._ensure_storage()
+
+        assert not api.create_namespaced_persistent_volume_claim.called
 
 
 def test_kubeflow_executor_default_init():
