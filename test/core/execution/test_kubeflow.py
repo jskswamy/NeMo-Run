@@ -115,7 +115,7 @@ class TestStorageMounts:
                 "namespace": "ns",
                 "nodes": 1,
                 "image": "img",
-                "volume_mount_path": "/src",
+                "workspace_mount_path": "/src",
                 "configmap_name": "cfg",
                 "cpu_limit": None,
                 "memory_limit": None,
@@ -196,7 +196,7 @@ def test_kubeflow_executor_default_init():
     assert executor.namespace == "default"
     assert executor.gpus is None
     assert executor.job_name == ""
-    assert executor.volume_mount_path == "/src"
+    assert executor.workspace_mount_path == "/src"
     assert isinstance(executor.packager, Packager)
 
 
@@ -207,7 +207,7 @@ def test_kubeflow_executor_custom_init():
         "ntasks_per_node": 4,
         "namespace": "training",
         "gpus": 8,
-        "volume_mount_path": "/custom/workspace",
+        "workspace_mount_path": "/custom/workspace",
     }
 
     executor = KubeflowExecutor(**custom_config)
@@ -216,7 +216,7 @@ def test_kubeflow_executor_custom_init():
     assert executor.ntasks_per_node == 4
     assert executor.namespace == "training"
     assert executor.gpus == 8
-    assert executor.volume_mount_path == "/custom/workspace"
+    assert executor.workspace_mount_path == "/custom/workspace"
 
 
 def test_kubeflow_executor_validation():
@@ -283,7 +283,7 @@ def test_kubeflow_executor_nproc_per_node():
             {
                 "nodes": 1,
                 "gpus": 4,
-                "volume_mount_path": "/custom/workspace",
+                "workspace_mount_path": "/custom/workspace",
             },
             1,
         ),
@@ -309,8 +309,8 @@ def test_kubeflow_executor_get_custom_trainer_inline(executor_kwargs, expected_n
         call_args = mock_trainer.call_args[1]
         assert call_args["num_nodes"] == expected_nodes
         # CommandTrainer should be invoked with runtime-aware command/args
-        mounted_path = f"{executor.volume_mount_path}/{executor.training_entry}"
-        assert call_args.get("command") in (["/bin/bash"], ["python"], ["bash"])
+        mounted_path = f"{executor.workspace_mount_path}/{executor.training_entry}"
+        assert call_args.get("command") in (["/bin/bash"], ["python"], ["bash"], ["torchrun"])
         assert mounted_path in " ".join(call_args.get("args", []))
 
         resources = call_args["resources_per_node"]
@@ -343,9 +343,8 @@ def test_kubeflow_executor_get_custom_trainer_function_based():
         mock_trainer.assert_called_once()
 
         kwargs = mock_trainer.call_args[1]
-        assert kwargs["command"] == ["/bin/bash"]
+        assert kwargs["command"] in (["/bin/bash"], ["torchrun"])
         args_joined = " ".join(kwargs.get("args", []))
-        assert "torchrun" in args_joined
         assert "--nnodes ${PET_NNODES}" in args_joined
         assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
         assert "--rdzv_backend c10d" in args_joined
@@ -370,7 +369,7 @@ def test_kubeflow_executor_get_custom_trainer_fallback():
 
         call_args = mock_trainer.call_args[1]
         assert call_args["num_nodes"] == 1
-        mounted_path = f"{executor.volume_mount_path}/{executor.training_entry}"
+        mounted_path = f"{executor.workspace_mount_path}/{executor.training_entry}"
         assert mounted_path in " ".join(call_args.get("args", []))
 
 
@@ -617,7 +616,7 @@ def test_kubeflow_executor_invalid_task():
 
         call_args = mock_trainer.call_args[1]
         # Invalid tasks are treated like script and use staged entry path
-        mounted_path = f"{executor.volume_mount_path}/{executor.training_entry}"
+        mounted_path = f"{executor.workspace_mount_path}/{executor.training_entry}"
         assert mounted_path in " ".join(call_args.get("args", []))
 
 
@@ -692,19 +691,17 @@ def test_kubeflow_executor_injects_torchrun_for_script():
         mock_trainer.assert_called_once()
 
         kwargs = mock_trainer.call_args[1]
-        # Always use bash -c with torchrun and PET-derived flags
-        assert kwargs["command"] == ["/bin/bash"]
+        # Use direct torchrun invocation with PET-derived flags
+        assert kwargs["command"] == ["torchrun"]
         args_list = kwargs.get("args")
         assert isinstance(args_list, list) and len(args_list) >= 2
-        assert args_list[0] == "-c"
         args_joined = " ".join(args_list)
-        assert "torchrun" in args_joined
         assert "--nnodes ${PET_NNODES}" in args_joined
         assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
         assert "--rdzv_backend c10d" in args_joined
         assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
         # Mounted script path
-        mounted_path = f"{executor.volume_mount_path}/{executor.training_entry}"
+        mounted_path = f"{executor.workspace_mount_path}/{executor.training_entry}"
         assert mounted_path in args_joined
 
 
@@ -725,16 +722,15 @@ def test_kubeflow_executor_wraps_bash_script_without_torchrun():
         mock_trainer.assert_called_once()
 
         kwargs = mock_trainer.call_args[1]
-        assert kwargs["command"] == ["/bin/bash"]
+        assert kwargs["command"] == ["torchrun"]
         args_list = kwargs.get("args")
         assert isinstance(args_list, list) and len(args_list) >= 2
-        assert args_list[0] == "-lc"
         args_joined = " ".join(args_list)
-        assert "torchrun" in args_joined
         assert "--nnodes ${PET_NNODES}" in args_joined
         assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
         assert "--rdzv_backend c10d" in args_joined
         assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
+        assert "--no-python" in args_joined
 
 
 def test_kubeflow_executor_pass_through_bash_with_torchrun():
@@ -754,12 +750,11 @@ def test_kubeflow_executor_pass_through_bash_with_torchrun():
         mock_trainer.assert_called_once()
 
         kwargs = mock_trainer.call_args[1]
-        assert kwargs["command"] == ["/bin/bash"]
+        mounted_path = f"{executor.workspace_mount_path}/{executor.training_entry}"
+        # Pass-through: command should be the staged script path, no PET flags injection
+        assert kwargs["command"] == [mounted_path]
         args_list = kwargs.get("args")
-        assert isinstance(args_list, list) and len(args_list) >= 2
-        assert args_list[0] == "-c"
-        args_joined = " ".join(args_list)
-        assert "torchrun --nnodes" not in args_joined
+        assert args_list == []
 
 
 def test_kubeflow_executor_injects_torchrun_for_partial():
@@ -783,11 +778,11 @@ def test_kubeflow_executor_injects_torchrun_for_partial():
         mock_trainer.assert_called_once()
 
         kwargs = mock_trainer.call_args[1]
-        assert kwargs["command"] == ["/bin/bash"]
+        assert kwargs["command"] in (["/bin/bash"], ["torchrun"])
         args_list = kwargs.get("args")
         assert isinstance(args_list, list) and len(args_list) >= 2
         args_joined = " ".join(args_list)
-        assert "torchrun" in args_joined
+        assert (kwargs["command"][0] == "torchrun") or ("torchrun" in args_joined)
         assert "--nnodes ${PET_NNODES}" in args_joined
         assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
         assert "--rdzv_backend c10d" in args_joined

@@ -127,7 +127,7 @@ spec:
                           value: /dev/aperture_devices
                       volumeMounts:
                         - name: workspace
-                          mountPath: {{ volume_mount_path }}
+                          mountPath: {{ workspace_mount_path }}
                         {% if storage_pvc_mounts %}
                         {% for pvc in storage_pvc_mounts %}
                         - name: {{ pvc.name }}

@@ -201,8 +201,8 @@ class KubeflowExecutor(Executor):
     #: Training job filename
     training_entry: str = "experiment"
 
-    #: Volume mount path for staged files (default: /src)
-    volume_mount_path: str = "/src"
+    #: Workspace mount path for staged files (default: /src)
+    workspace_mount_path: str = "/src"
 
     #: TrainerClient instance for managing TrainJob objects
     _trainer_client: Optional[TrainerClient] = field(init=False, repr=False, default=None)
@@ -353,7 +353,7 @@ class KubeflowExecutor(Executor):
             "namespace": self.namespace,
             "nodes": self.nodes,
             "image": self.image,
-            "volume_mount_path": self.volume_mount_path,
+            "workspace_mount_path": self.workspace_mount_path,
             "configmap_name": configmap_name,
             "cpu_limit": self.cpu_limit,
             "memory_limit": self.memory_limit,
@@ -530,14 +530,8 @@ class KubeflowExecutor(Executor):
         if self.gpus is not None:
             resources_per_node["nvidia.com/gpu"] = str(self.gpus)
 
-        mounted_path = f"{self.volume_mount_path}/{self.training_entry}"
-        if hasattr(task, "__fn_or_cls__"):
-            command, args = _build_launcher_command_and_args("python", "", mounted_path)
-        else:
-            # ToDo: getattr takes care of the default case no need for or "bash"
-            entrypoint = (getattr(task, "entrypoint", "bash") or "bash").strip()
-            inline = (getattr(task, "inline", "") or "").strip()
-            command, args = _build_launcher_command_and_args(entrypoint, inline, mounted_path)
+        mounted_path = f"{self.workspace_mount_path}/{self.training_entry}"
+        command, args = _build_trainer_command(task, mounted_path)
 
         trainer = CommandTrainer(
             command=command,
@@ -680,7 +674,7 @@ class KubeflowExecutor(Executor):
     def _get_staged_file_path(self, filename: str) -> str:
         """Return path where a staged file would be mounted inside the container.
 
-        If using ConfigMapPackager, files are mounted under volume_mount_path with
+        If using ConfigMapPackager, files are mounted under workspace_mount_path with
         experiment-specific prefix. Otherwise, return the filename unchanged.
         """
         if (
@@ -688,5 +682,5 @@ class KubeflowExecutor(Executor):
             and hasattr(self, "experiment_name")
             and self.experiment_name
         ):
-            return f"{self.volume_mount_path}/{self.experiment_name}-{filename}"
+            return f"{self.workspace_mount_path}/{self.experiment_name}-{filename}"
         return filename
