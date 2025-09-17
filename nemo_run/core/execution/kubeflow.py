@@ -373,6 +373,9 @@ class KubeflowExecutor(Executor):
         # Ensure storage objects exist prior to runtime creation
         self._ensure_storage()
 
+        # Ensure env secret exists prior to runtime creation
+        env_from_secrets: list[str] = self._ensure_env_secret(sha)
+
         template_vars = {
             "runtime_name": runtime_name,
             "namespace": self.namespace,
@@ -385,6 +388,7 @@ class KubeflowExecutor(Executor):
             "gpus": self.gpus,
             "enable_tcpxo": self.enable_tcpxo,
             "storage_pvc_mounts": self._get_normalized_storage_mounts(),
+            "env_from_secrets": env_from_secrets,
         }
         rendered = fill_template(
             template_name="kubeflow_clustertrainingruntime.yaml.j2",
@@ -506,6 +510,37 @@ class KubeflowExecutor(Executor):
                 logger.warning(f"Failed staging task content: {e}")
 
         return files_to_stage
+
+    def _ensure_env_secret(self, sha: str) -> list[str]:
+        """Ensure a Secret exists when env_vars are configured; return list of envFrom names."""
+        if not self.env_vars:
+            return []
+        generated_secret_name = self._env_secret_name(sha)
+        try:
+            core_client = client.CoreV1Api()
+            body = client.V1Secret(
+                metadata=client.V1ObjectMeta(name=generated_secret_name, namespace=self.namespace),
+                string_data=self.env_vars,
+                type="Opaque",
+            )
+            core_client.create_namespaced_secret(namespace=self.namespace, body=body)
+            logger.info(f"Created Secret {generated_secret_name} in {self.namespace}")
+        except ApiException as e:
+            if e.status == 409:
+                # Secret exists; patch to ensure latest env_vars are reflected
+                try:
+                    patch_body = {"stringData": self.env_vars, "type": "Opaque"}
+                    core_client.patch_namespaced_secret(
+                        name=generated_secret_name, namespace=self.namespace, body=patch_body
+                    )
+                    logger.info(
+                        f"Patched Secret {generated_secret_name} with updated stringData in {self.namespace}"
+                    )
+                except Exception as patch_err:
+                    logger.warning(f"Failed to patch Secret {generated_secret_name}: {patch_err}")
+            else:
+                logger.warning(f"Failed to create Secret {generated_secret_name}: {e}")
+        return [generated_secret_name]
 
     def stage_files(self, task_dir: str, task=None) -> tuple[str, str]:
         """Stage files using the packager.
@@ -699,6 +734,11 @@ class KubeflowExecutor(Executor):
         """Build CRT name from the shared experiment identifier and sha."""
         identifier = self._get_experiment_identifier()
         return sanitize_kubernetes_name(f"nemo-runtime-{identifier}-{sha}")
+
+    def _env_secret_name(self, sha: str) -> str:
+        """Return a deterministic Secret name for env vars derived from experiment+sha."""
+        identifier = self._get_experiment_identifier()
+        return sanitize_kubernetes_name(f"nemo-env-{identifier}-{sha}")
 
     def _get_staged_file_path(self, filename: str) -> str:
         """Return path where a staged file would be mounted inside the container.

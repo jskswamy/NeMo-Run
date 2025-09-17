@@ -125,6 +125,13 @@ spec:
                           value: /usr/local/nvidia/lib64
                         - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
                           value: /dev/aperture_devices
+                      {% if env_from_secrets and env_from_secrets|length > 0 %}
+                      envFrom:
+                        {% for s in env_from_secrets %}
+                        - secretRef:
+                            name: {{ s }}
+                        {% endfor %}
+                      {% endif %}
                       volumeMounts:
                         - name: workspace
                           mountPath: {{ workspace_mount_path }}
