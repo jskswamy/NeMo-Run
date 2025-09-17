@@ -138,6 +138,28 @@ class TestStorageMounts:
         assert "mountPath: /mnt/a" in rendered
         assert "readOnly: true" in rendered
 
+    def test_crt_template_renders_envfrom_secret(self):
+        rendered = fill_template(
+            template_name="kubeflow_clustertrainingruntime.yaml.j2",
+            variables={
+                "runtime_name": "rt",
+                "namespace": "ns",
+                "nodes": 1,
+                "image": "img",
+                "workspace_mount_path": "/src",
+                "configmap_name": "cfg",
+                "cpu_limit": None,
+                "memory_limit": None,
+                "gpus": None,
+                "enable_tcpxo": False,
+                "storage_pvc_mounts": [],
+                "env_from_secrets": ["my-secret"],
+            },
+        )
+
+        assert "envFrom:" in rendered
+        assert "name: my-secret" in rendered
+
     def test_pvc_creation_when_missing(self, mocker):
         # Configure an executor with a PVC that should be created
 
@@ -372,6 +394,66 @@ def test_kubeflow_executor_get_custom_trainer_fallback():
         assert call_args["num_nodes"] == 1
         mounted_path = f"{executor.workspace_mount_path}/{executor.training_entry}"
         assert mounted_path in " ".join(call_args.get("args", []))
+
+
+class TestEnvSecretHandling:
+    def test_secret_creation_without_conflict(self, mocker):
+        executor = KubeflowExecutor(namespace="default")
+        executor.packager = ConfigMapPackager()
+        executor.assign("exp-abc", "/tmp/exp", "task-1", "task_dir")
+
+        executor.env_vars = {"CONFIG_KEY1": "xyz", "FOO": "bar"}
+
+        mock_core = mocker.patch("kubernetes.client.CoreV1Api")
+        api = mock_core.return_value
+        # No exception on create (no conflict)
+        api.create_namespaced_secret.return_value = None
+
+        with patch("nemo_run.core.execution.kubeflow.fill_template") as ft:
+            ft.return_value = "apiVersion: v1\nkind: ClusterTrainingRuntime\nmetadata: {}"
+            with patch("kubernetes.client.CustomObjectsApi") as mock_coa:
+                coa = mock_coa.return_value
+                coa.create_cluster_custom_object.return_value = {}
+
+                executor._create_cluster_training_runtime(configmap_name="cfg", sha="beadfeed")
+
+        # Ensure create was called, and patch was NOT called
+        assert api.create_namespaced_secret.called
+        assert not api.patch_namespaced_secret.called
+
+        # Capture variables passed to template and assert env_from_secrets includes our secret
+        called_vars = ft.call_args[1]["variables"]
+        assert "env_from_secrets" in called_vars
+        assert isinstance(called_vars["env_from_secrets"], list)
+        assert len(called_vars["env_from_secrets"]) == 1
+
+    def test_secret_creation_and_patch_on_conflict(self, mocker):
+        executor = KubeflowExecutor(namespace="default")
+        executor.packager = ConfigMapPackager()
+        # Simulate assignment to set experiment identifier used in secret name
+        executor.assign("exp-xyz", "/tmp/exp", "task-1", "task_dir")
+
+        # Set env vars that should be converted to a Secret
+        executor.env_vars = {"CONFIG_KEY1": "abc", "OTHER": "val"}
+
+        # Mock k8s CoreV1Api to simulate create 409 then patch
+        mock_core = mocker.patch("kubernetes.client.CoreV1Api")
+        api = mock_core.return_value
+        from kubernetes.client.exceptions import ApiException
+
+        # First call: create raises 409 (already exists)
+        api.create_namespaced_secret.side_effect = ApiException(status=409)
+
+        # Run ensure function indirectly via _create_cluster_training_runtime
+        with patch("nemo_run.core.execution.kubeflow.fill_template") as ft:
+            ft.return_value = "apiVersion: v1\nkind: ClusterTrainingRuntime\nmetadata: {}"
+            with patch("kubernetes.client.CustomObjectsApi") as mock_coa:
+                coa = mock_coa.return_value
+                coa.create_cluster_custom_object.return_value = {}
+                # Should call patch on conflict
+                executor._create_cluster_training_runtime(configmap_name="cfg", sha="deadbeef")
+
+        assert api.patch_namespaced_secret.called
 
 
 def test_kubeflow_executor_create_trainjob():
