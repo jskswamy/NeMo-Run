@@ -16,7 +16,7 @@
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Union
 
 import yaml
@@ -139,13 +139,35 @@ class StorageMount:
     def get_volume_name(self, index: int) -> str:
         """Return a DNS-1123 safe volume name, defaulting to pvc-{index}."""
         base = self.name or f"pvc-{index}"
-        return sanitize_kubernetes_name(base)
+        return sanitize_kubernetes_name(base).lower()
 
     def get_pvc_claim_name(self) -> Optional[str]:
         """Return a DNS-1123 safe PVC claim name or None if unset."""
         if not self.pvc_claim_name:
             return None
-        return sanitize_kubernetes_name(self.pvc_claim_name)
+        return sanitize_kubernetes_name(self.pvc_claim_name).lower()
+
+
+@dataclass
+class AdditionalPackages:
+    """Optional package installation configuration for the training container.
+
+    Fields map directly to SDK `CommandTrainer` parameters.
+    """
+
+    packages_to_install: Optional[list[str]] = None
+    pip_index_urls: Optional[list[str]] = None
+    pip_extra_args: Optional[list[str]] = None
+
+    def as_trainer_kwargs(self) -> Dict[str, Any]:
+        """Return subset of kwargs for CommandTrainer based on configured fields."""
+        allowed = {"packages_to_install", "pip_index_urls", "pip_extra_args"}
+        return asdict(
+            self,
+            dict_factory=lambda items: {
+                k: (list(v) if isinstance(v, list) else v) for k, v in items if k in allowed and v
+            },
+        )
 
 
 @dataclass(kw_only=True)
@@ -223,6 +245,9 @@ class KubeflowExecutor(Executor):
     enable_tcpxo: bool = False
 
     storage_mounts: list["StorageMount"] = field(default_factory=list)
+
+    #: Optional package installation configuration
+    additional_packages: Optional[AdditionalPackages] = None
 
     def __post_init__(self):
         """Validate executor configuration and setup Kubernetes access."""
@@ -533,12 +558,16 @@ class KubeflowExecutor(Executor):
         mounted_path = f"{self.workspace_mount_path}/{self.training_entry}"
         command, args = _build_trainer_command(task, mounted_path)
 
-        trainer = CommandTrainer(
-            command=command,
-            args=args,
-            num_nodes=self.nodes,
-            resources_per_node=resources_per_node,
-        )
+        trainer_kwargs: Dict[str, Any] = {
+            "command": command,
+            "args": args,
+            "num_nodes": self.nodes,
+            "resources_per_node": resources_per_node,
+        }
+        if self.additional_packages:
+            trainer_kwargs.update(self.additional_packages.as_trainer_kwargs())
+
+        trainer = CommandTrainer(**trainer_kwargs)
 
         logger.info(
             f"CommandTrainer created with command={trainer.command}, args={trainer.args}, "

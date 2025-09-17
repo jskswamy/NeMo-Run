@@ -21,6 +21,7 @@ from kubernetes.client.exceptions import ApiException
 
 from nemo_run.config import Partial, Script
 from nemo_run.core.execution.kubeflow import (
+    AdditionalPackages,
     KubeflowExecutor,
     StorageMount,
 )
@@ -787,3 +788,28 @@ def test_kubeflow_executor_injects_torchrun_for_partial():
         assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
         assert "--rdzv_backend c10d" in args_joined
         assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
+
+
+def test_executor_additional_packages_forwarding():
+    script_task = Script(inline="python train.py")
+    executor = KubeflowExecutor(nodes=1, ntasks_per_node=4)
+    executor.packager = ConfigMapPackager()
+    executor.assign("exp-abc123", "/tmp/exp", "task-1", "task_dir")
+
+    executor.additional_packages = AdditionalPackages(
+        packages_to_install=["nemo==2.0.0", "deepspeed>=0.14.0"],
+        pip_index_urls=["https://pypi.org/simple", "https://extra/simple"],
+        pip_extra_args=["--no-cache-dir", "--find-links", "/wheels"],
+    )
+
+    with patch("nemo_run.core.execution.kubeflow.CommandTrainer") as mock_trainer:
+        instance = MagicMock()
+        mock_trainer.return_value = instance
+
+        res = executor._get_custom_trainer(script_task)
+
+        assert res == instance
+        kwargs = mock_trainer.call_args[1]
+        assert kwargs["packages_to_install"] == ["nemo==2.0.0", "deepspeed>=0.14.0"]
+        assert kwargs["pip_index_urls"] == ["https://pypi.org/simple", "https://extra/simple"]
+        assert kwargs["pip_extra_args"] == ["--no-cache-dir", "--find-links", "/wheels"]
