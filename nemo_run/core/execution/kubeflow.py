@@ -214,11 +214,11 @@ class KubeflowExecutor(Executor):
     #: Resource limits for memory
     memory_limit: Optional[str] = None
 
-    #: Number of GPUs to request
-    gpus: Optional[int] = None
+    #: Number of GPUs per node to request
+    gpus_per_node: Optional[int] = None
 
     #: Container image for training jobs
-    image: str = "nvcr.io/nvidia/nemo:dev"
+    container_image: str = "nvcr.io/nvidia/nemo:dev"
 
     #: Training job filename
     training_entry: str = "experiment"
@@ -380,12 +380,13 @@ class KubeflowExecutor(Executor):
             "runtime_name": runtime_name,
             "namespace": self.namespace,
             "nodes": self.nodes,
-            "image": self.image,
+            "image": self.container_image,
             "workspace_mount_path": self.workspace_mount_path,
             "configmap_name": configmap_name,
             "cpu_limit": self.cpu_limit,
             "memory_limit": self.memory_limit,
-            "gpus": self.gpus,
+            "gpus": self.gpus_per_node,
+            "num_proc_per_node": self.ntasks_per_node,
             "enable_tcpxo": self.enable_tcpxo,
             "storage_pvc_mounts": self._get_normalized_storage_mounts(),
             "env_from_secrets": env_from_secrets,
@@ -587,8 +588,8 @@ class KubeflowExecutor(Executor):
             resources_per_node["cpu"] = self.cpu_limit
         if self.memory_limit is not None:
             resources_per_node["memory"] = self.memory_limit
-        if self.gpus is not None:
-            resources_per_node["nvidia.com/gpu"] = str(self.gpus)
+        if self.gpus_per_node is not None:
+            resources_per_node["nvidia.com/gpu"] = str(self.gpus_per_node)
 
         mounted_path = f"{self.workspace_mount_path}/{self.training_entry}"
         command, args = _build_trainer_command(task, mounted_path)
@@ -728,7 +729,7 @@ class KubeflowExecutor(Executor):
 
     def info(self) -> str:
         """Get information about the executor configuration."""
-        return f"KubeflowExecutor (nodes={self.nodes}, gpus={self.gpus or 0})"
+        return f"KubeflowExecutor (nodes={self.nodes}, gpus={self.gpus_per_node or 0})"
 
     def _runtime_name(self, sha: str) -> str:
         """Build CRT name from the shared experiment identifier and sha."""
