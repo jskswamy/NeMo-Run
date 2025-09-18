@@ -49,8 +49,12 @@ def _build_trainer_command(task, mounted_path: str) -> tuple[list[str], list[str
     is_python = is_partial or bool(re.search(r"(^|/)?python(\d+(\.\d+)*)?$", ep, re.IGNORECASE))
     is_bash = bool(re.search(r"(^|/)?bash$", ep, re.IGNORECASE))
 
-    # Shared PET-derived rendezvous args
-    base_args: list[str] = [
+    # Pass-through for bash inline that already includes torchrun
+    if is_bash and re.search(r"(^|\s)torchrun(\s|$)", inline):
+        return [mounted_path], []
+
+    # Build PET-driven torchrun invocation; rely on Kubeflow to populate PET_* envs
+    args: list[str] = [
         "--nnodes",
         "${PET_NNODES}",
         "--nproc_per_node",
@@ -60,13 +64,6 @@ def _build_trainer_command(task, mounted_path: str) -> tuple[list[str], list[str
         "--rdzv_endpoint",
         "${PET_MASTER_ADDR}:${PET_MASTER_PORT}",
     ]
-
-    # Pass-through for bash inline that already includes torchrun
-    if is_bash and re.search(r"(^|\s)torchrun(\s|$)", inline):
-        return [mounted_path], []
-
-    # Build args once; add --no-python for non-python entrypoints
-    args: list[str] = [*base_args]
     if not is_python:
         args.append("--no-python")
     args.append(mounted_path)
@@ -202,8 +199,8 @@ class KubeflowExecutor(Executor):
     #: Number of nodes for distributed training
     nodes: int = 1
 
-    #: Number of processes per node (typically matches number of GPUs)
-    ntasks_per_node: int = 1
+    #: Number of processes per node (typically matches number of GPUs). If None, let runtime infer.
+    ntasks_per_node: Optional[int] = None
 
     #: Kubernetes namespace for the training job
     namespace: str = "default"
@@ -253,8 +250,25 @@ class KubeflowExecutor(Executor):
         """Validate executor configuration and setup Kubernetes access."""
         if self.nodes < 1:
             raise ValueError("nodes must be >= 1")
-        if self.ntasks_per_node < 1:
-            raise ValueError("ntasks_per_node must be >= 1")
+        if self.ntasks_per_node is not None and self.ntasks_per_node < 1:
+            raise ValueError("ntasks_per_node must be >= 1 when set")
+
+        # Defensive validations to avoid runtime world-size mismatches
+        # 1) Multi-node without GPUs or explicit nproc per node is risky
+        if self.nodes > 1 and self.ntasks_per_node is None and self.gpus_per_node is None:
+            raise ValueError(
+                "Multi-node training requires either gpus_per_node or ntasks_per_node to be set"
+            )
+
+        # 2) If both GPUs and nproc are set, ensure nproc does not exceed GPUs
+        if (
+            self.ntasks_per_node is not None
+            and self.gpus_per_node is not None
+            and self.ntasks_per_node > self.gpus_per_node
+        ):
+            raise ValueError(
+                "ntasks_per_node cannot be greater than gpus_per_node; set ntasks_per_node <= gpus_per_node"
+            )
 
         # Setup Kubernetes configuration
         self._setup_kubernetes_config()
@@ -314,9 +328,17 @@ class KubeflowExecutor(Executor):
         """Return the number of nodes for distributed training."""
         return self.nodes
 
-    def nproc_per_node(self) -> int:
-        """Return the number of processes per node."""
+    def nproc_per_node(self) -> Optional[int]:
+        """Return the configured number of processes per node, or None for auto."""
         return self.ntasks_per_node
+
+    def num_proc(self) -> Optional[int]:
+        """Return preferred num processes per node for CRT: ntasks_per_node, else gpus_per_node, else None."""
+        if self.ntasks_per_node is not None:
+            return self.ntasks_per_node
+        if self.gpus_per_node is not None:
+            return self.gpus_per_node
+        return None
 
     def macro_values(self) -> Optional[ExecutorMacros]:
         return None
@@ -386,7 +408,7 @@ class KubeflowExecutor(Executor):
             "cpu_limit": self.cpu_limit,
             "memory_limit": self.memory_limit,
             "gpus": self.gpus_per_node,
-            "num_proc_per_node": self.ntasks_per_node,
+            "num_proc_per_node": self.num_proc(),
             "enable_tcpxo": self.enable_tcpxo,
             "storage_pvc_mounts": self._get_normalized_storage_mounts(),
             "env_from_secrets": env_from_secrets,

@@ -7,9 +7,11 @@ metadata:
     trainer.kubeflow.org/framework: torch
 spec:
   mlPolicy:
-    numNodes: 1
+    numNodes: {{ nodes }}
     torch:
+      {% if num_proc_per_node is not none %}
       numProcPerNode: {{ num_proc_per_node }}
+      {% endif %}
   template:
     spec:
       replicatedJobs:

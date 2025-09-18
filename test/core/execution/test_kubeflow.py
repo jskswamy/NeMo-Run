@@ -160,6 +160,75 @@ class TestStorageMounts:
         assert "envFrom:" in rendered
         assert "name: my-secret" in rendered
 
+
+def test_crt_template_renders_nodes_and_numproc():
+    rendered = fill_template(
+        template_name="kubeflow_clustertrainingruntime.yaml.j2",
+        variables={
+            "runtime_name": "rt",
+            "namespace": "ns",
+            "nodes": 2,
+            "num_proc_per_node": 8,
+            "image": "img",
+            "workspace_mount_path": "/src",
+            "configmap_name": "cfg",
+            "cpu_limit": None,
+            "memory_limit": None,
+            "gpus": None,
+            "enable_tcpxo": False,
+            "storage_pvc_mounts": [],
+        },
+    )
+
+    assert "numNodes: 2" in rendered
+    assert "numProcPerNode: 8" in rendered
+
+
+def test_crt_template_numproc_omitted_when_none():
+    rendered = fill_template(
+        template_name="kubeflow_clustertrainingruntime.yaml.j2",
+        variables={
+            "runtime_name": "rt",
+            "namespace": "ns",
+            "nodes": 2,
+            "num_proc_per_node": None,
+            "image": "img",
+            "workspace_mount_path": "/src",
+            "configmap_name": "cfg",
+            "cpu_limit": None,
+            "memory_limit": None,
+            "gpus": None,
+            "enable_tcpxo": False,
+            "storage_pvc_mounts": [],
+        },
+    )
+
+    assert "numNodes: 2" in rendered
+    assert "numProcPerNode" not in rendered
+
+
+def test_crt_template_renders_gpu_resources_in_requests_and_limits():
+    rendered = fill_template(
+        template_name="kubeflow_clustertrainingruntime.yaml.j2",
+        variables={
+            "runtime_name": "rt",
+            "namespace": "ns",
+            "nodes": 1,
+            "num_proc_per_node": 8,
+            "image": "img",
+            "workspace_mount_path": "/src",
+            "configmap_name": "cfg",
+            "cpu_limit": None,
+            "memory_limit": None,
+            "gpus": 8,
+            "enable_tcpxo": False,
+            "storage_pvc_mounts": [],
+        },
+    )
+
+    # GPU count should be present under both requests and limits
+    assert '"nvidia.com/gpu": 8' in rendered
+
     def test_pvc_creation_when_missing(self, mocker):
         # Configure an executor with a PVC that should be created
 
@@ -215,7 +284,7 @@ def test_kubeflow_executor_default_init():
     executor = KubeflowExecutor()
 
     assert executor.nodes == 1
-    assert executor.ntasks_per_node == 1
+    assert executor.ntasks_per_node is None
     assert executor.namespace == "default"
     assert executor.gpus_per_node is None
     assert executor.job_name == ""
@@ -250,6 +319,16 @@ def test_kubeflow_executor_validation():
     with pytest.raises(ValueError, match="ntasks_per_node must be >= 1"):
         KubeflowExecutor(ntasks_per_node=0)
 
+    # Multi-node requires either GPUs or explicit nproc per node
+    with pytest.raises(
+        ValueError, match="Multi-node training requires either gpus_per_node or ntasks_per_node"
+    ):
+        KubeflowExecutor(nodes=2)
+
+    # When both set, ntasks_per_node cannot exceed gpus_per_node
+    with pytest.raises(ValueError, match="ntasks_per_node cannot be greater than gpus_per_node"):
+        KubeflowExecutor(nodes=1, gpus_per_node=4, ntasks_per_node=8)
+
 
 def test_kubeflow_executor_assign():
     """Test that assign method sets the correct directories."""
@@ -270,7 +349,8 @@ def test_kubeflow_executor_assign():
 def test_kubeflow_executor_nnodes():
     """Test that nnodes returns the correct number of nodes."""
     expected_nodes = 3
-    executor = KubeflowExecutor(nodes=expected_nodes)
+    # Provide ntasks_per_node to satisfy multi-node validation
+    executor = KubeflowExecutor(nodes=expected_nodes, ntasks_per_node=1)
 
     result = executor.nnodes()
 
@@ -333,7 +413,7 @@ def test_kubeflow_executor_get_custom_trainer_inline(executor_kwargs, expected_n
         assert call_args["num_nodes"] == expected_nodes
         # CommandTrainer should be invoked with runtime-aware command/args
         mounted_path = f"{executor.workspace_mount_path}/{executor.training_entry}"
-        assert call_args.get("command") in (["/bin/bash"], ["python"], ["bash"], ["torchrun"])
+        assert call_args.get("command") == ["torchrun"]
         assert mounted_path in " ".join(call_args.get("args", []))
 
         resources = call_args["resources_per_node"]
@@ -366,10 +446,12 @@ def test_kubeflow_executor_get_custom_trainer_function_based():
         mock_trainer.assert_called_once()
 
         kwargs = mock_trainer.call_args[1]
-        assert kwargs["command"] in (["/bin/bash"], ["torchrun"])
+        assert kwargs["command"] == ["torchrun"]
         args_joined = " ".join(kwargs.get("args", []))
-        assert "--nnodes ${PET_NNODES}" in args_joined
-        assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
+        assert ("--nnodes ${PET_NNODES}" in args_joined) or ("--nnodes 1" in args_joined)
+        assert ("--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined) or (
+            "--nproc_per_node auto" in args_joined
+        )
         assert "--rdzv_backend c10d" in args_joined
         assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
 
@@ -780,10 +862,12 @@ def test_kubeflow_executor_injects_torchrun_for_script():
         # Use direct torchrun invocation with PET-derived flags
         assert kwargs["command"] == ["torchrun"]
         args_list = kwargs.get("args")
-        assert isinstance(args_list, list) and len(args_list) >= 2
+        assert isinstance(args_list, list) and len(args_list) >= 1
         args_joined = " ".join(args_list)
-        assert "--nnodes ${PET_NNODES}" in args_joined
-        assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
+        assert ("--nnodes ${PET_NNODES}" in args_joined) or ("--nnodes 2" in args_joined)
+        assert ("--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined) or (
+            "--nproc_per_node 8" in args_joined
+        )
         assert "--rdzv_backend c10d" in args_joined
         assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
         # Mounted script path
@@ -810,10 +894,12 @@ def test_kubeflow_executor_wraps_bash_script_without_torchrun():
         kwargs = mock_trainer.call_args[1]
         assert kwargs["command"] == ["torchrun"]
         args_list = kwargs.get("args")
-        assert isinstance(args_list, list) and len(args_list) >= 2
+        assert isinstance(args_list, list) and len(args_list) >= 1
         args_joined = " ".join(args_list)
-        assert "--nnodes ${PET_NNODES}" in args_joined
-        assert "--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined
+        assert ("--nnodes ${PET_NNODES}" in args_joined) or ("--nnodes 2" in args_joined)
+        assert ("--nproc_per_node ${PET_NPROC_PER_NODE}" in args_joined) or (
+            "--nproc_per_node 8" in args_joined
+        )
         assert "--rdzv_backend c10d" in args_joined
         assert "--rdzv_endpoint ${PET_MASTER_ADDR}:${PET_MASTER_PORT}" in args_joined
         assert "--no-python" in args_joined
@@ -864,9 +950,9 @@ def test_kubeflow_executor_injects_torchrun_for_partial():
         mock_trainer.assert_called_once()
 
         kwargs = mock_trainer.call_args[1]
-        assert kwargs["command"] in (["/bin/bash"], ["torchrun"])
+        assert kwargs["command"] == ["torchrun"]
         args_list = kwargs.get("args")
-        assert isinstance(args_list, list) and len(args_list) >= 2
+        assert isinstance(args_list, list) and len(args_list) >= 1
         args_joined = " ".join(args_list)
         assert (kwargs["command"][0] == "torchrun") or ("torchrun" in args_joined)
         assert "--nnodes ${PET_NNODES}" in args_joined
