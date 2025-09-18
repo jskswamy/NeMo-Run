@@ -160,6 +160,52 @@ class TestStorageMounts:
         assert "envFrom:" in rendered
         assert "name: my-secret" in rendered
 
+
+def test_crt_template_renders_nodes_and_numproc():
+    rendered = fill_template(
+        template_name="kubeflow_clustertrainingruntime.yaml.j2",
+        variables={
+            "runtime_name": "rt",
+            "namespace": "ns",
+            "nodes": 2,
+            "num_proc_per_node": 8,
+            "image": "img",
+            "workspace_mount_path": "/src",
+            "configmap_name": "cfg",
+            "cpu_limit": None,
+            "memory_limit": None,
+            "gpus": None,
+            "enable_tcpxo": False,
+            "storage_pvc_mounts": [],
+        },
+    )
+
+    assert "numNodes: 2" in rendered
+    assert "numProcPerNode: 8" in rendered
+
+
+def test_crt_template_renders_gpu_resources_in_requests_and_limits():
+    rendered = fill_template(
+        template_name="kubeflow_clustertrainingruntime.yaml.j2",
+        variables={
+            "runtime_name": "rt",
+            "namespace": "ns",
+            "nodes": 1,
+            "num_proc_per_node": 8,
+            "image": "img",
+            "workspace_mount_path": "/src",
+            "configmap_name": "cfg",
+            "cpu_limit": None,
+            "memory_limit": None,
+            "gpus": 8,
+            "enable_tcpxo": False,
+            "storage_pvc_mounts": [],
+        },
+    )
+
+    # GPU count should be present under both requests and limits
+    assert '"nvidia.com/gpu": 8' in rendered
+
     def test_pvc_creation_when_missing(self, mocker):
         # Configure an executor with a PVC that should be created
 

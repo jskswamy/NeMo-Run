@@ -7,7 +7,7 @@ metadata:
     trainer.kubeflow.org/framework: torch
 spec:
   mlPolicy:
-    numNodes: 1
+    numNodes: {{ nodes }}
     torch:
       numProcPerNode: {{ num_proc_per_node }}
   template:
