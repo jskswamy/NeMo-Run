@@ -217,7 +217,7 @@ def test_kubeflow_executor_default_init():
     assert executor.nodes == 1
     assert executor.ntasks_per_node == 1
     assert executor.namespace == "default"
-    assert executor.gpus is None
+    assert executor.gpus_per_node is None
     assert executor.job_name == ""
     assert executor.workspace_mount_path == "/src"
     assert isinstance(executor.packager, Packager)
@@ -229,7 +229,7 @@ def test_kubeflow_executor_custom_init():
         "nodes": 2,
         "ntasks_per_node": 4,
         "namespace": "training",
-        "gpus": 8,
+        "gpus_per_node": 8,
         "workspace_mount_path": "/custom/workspace",
     }
 
@@ -238,7 +238,7 @@ def test_kubeflow_executor_custom_init():
     assert executor.nodes == 2
     assert executor.ntasks_per_node == 4
     assert executor.namespace == "training"
-    assert executor.gpus == 8
+    assert executor.gpus_per_node == 8
     assert executor.workspace_mount_path == "/custom/workspace"
 
 
@@ -296,7 +296,7 @@ def test_kubeflow_executor_nproc_per_node():
         (
             {
                 "nodes": 2,
-                "gpus": 8,
+                "gpus_per_node": 8,
                 "cpu_limit": "16",
                 "memory_limit": "32Gi",
             },
@@ -305,7 +305,7 @@ def test_kubeflow_executor_nproc_per_node():
         (
             {
                 "nodes": 1,
-                "gpus": 4,
+                "gpus_per_node": 4,
                 "workspace_mount_path": "/custom/workspace",
             },
             1,
@@ -341,8 +341,8 @@ def test_kubeflow_executor_get_custom_trainer_inline(executor_kwargs, expected_n
             assert resources["cpu"] == executor_kwargs["cpu_limit"]
         if "memory_limit" in executor_kwargs:
             assert resources["memory"] == executor_kwargs["memory_limit"]
-        if "gpus" in executor_kwargs:
-            assert resources["nvidia.com/gpu"] == str(executor_kwargs["gpus"])
+        if "gpus_per_node" in executor_kwargs:
+            assert resources["nvidia.com/gpu"] == str(executor_kwargs["gpus_per_node"])
 
 
 def test_kubeflow_executor_get_custom_trainer_function_based():
@@ -352,7 +352,7 @@ def test_kubeflow_executor_get_custom_trainer_function_based():
         return "function result"
 
     partial_task = Partial(dummy_function)
-    executor = KubeflowExecutor(nodes=1, gpus=4)
+    executor = KubeflowExecutor(nodes=1, gpus_per_node=4)
     executor.packager = ConfigMapPackager()
     executor.assign("exp-123", "/tmp/exp", "task-1", "task_dir")
 
@@ -414,7 +414,8 @@ class TestEnvSecretHandling:
             with patch("kubernetes.client.CustomObjectsApi") as mock_coa:
                 coa = mock_coa.return_value
                 coa.create_cluster_custom_object.return_value = {}
-
+                # Ensure executor believes Kubernetes is available for this test
+                executor._kubernetes_available = True
                 executor._create_cluster_training_runtime(configmap_name="cfg", sha="beadfeed")
 
         # Ensure create was called, and patch was NOT called
@@ -451,6 +452,8 @@ class TestEnvSecretHandling:
                 coa = mock_coa.return_value
                 coa.create_cluster_custom_object.return_value = {}
                 # Should call patch on conflict
+                # Ensure executor believes Kubernetes is available for this test
+                executor._kubernetes_available = True
                 executor._create_cluster_training_runtime(configmap_name="cfg", sha="deadbeef")
 
         assert api.patch_namespaced_secret.called
@@ -615,7 +618,7 @@ def test_kubeflow_executor_info():
     """Test info method."""
     expected_nodes = 2
     expected_gpus = 4
-    executor = KubeflowExecutor(nodes=expected_nodes, gpus=expected_gpus)
+    executor = KubeflowExecutor(nodes=expected_nodes, gpus_per_node=expected_gpus)
 
     info = executor.info()
 

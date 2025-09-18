@@ -9,7 +9,7 @@ spec:
   mlPolicy:
     numNodes: 1
     torch:
-      numProcPerNode: "auto"
+      numProcPerNode: {{ num_proc_per_node }}
   template:
     spec:
       replicatedJobs:
