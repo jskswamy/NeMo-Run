@@ -141,10 +141,10 @@ class TestConfigMapPackager:
         assert result == "mistral.py"
 
     def test_sanitize_configmap_key_with_special_characters(self):
-        """Test _sanitize_configmap_key with special characters in filename."""
+        """Test _sanitize_configmap_key keeps underscores in keys (allowed by K8s)."""
         packager = ConfigMapPackager()
         result = packager._sanitize_configmap_key(Path("file_with_underscores.py"))
-        assert result == "file-with-underscores.py"
+        assert result == "file_with_underscores.py"
 
     def test_sanitize_configmap_key_with_complex_paths(self):
         """Test _sanitize_configmap_key with complex nested paths."""

@@ -97,9 +97,11 @@ class ConfigMapPackager(Packager):
         Returns:
             A sanitized ConfigMap key that complies with Kubernetes naming rules
         """
-        # Replace forward slashes with hyphens and sanitize for Kubernetes naming
-        sanitized_key = str(rel_path).replace("/", "-")
-        return sanitize_kubernetes_name(sanitized_key)
+        # Replace forward slashes with hyphens to satisfy key format in our mount path
+        # Preserve underscores and dots in file names. Only the ConfigMap NAME must be DNS-1123 safe,
+        # keys may contain underscores. See: ConfigMaps docs (envFrom example)
+        # https://kubernetes.io/docs/concepts/configuration/configmap/
+        return str(rel_path).replace("/", "-")
 
     def package_default(self, name: str) -> str:
         """
