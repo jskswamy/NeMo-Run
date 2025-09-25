@@ -77,16 +77,13 @@ spec:
                     {% endif %}
                     - name: libraries
                       hostPath:
-                        path: /home/kubernetes/bin/nvidia/lib64
+                        path: /home/kubernetes/bin/nvidia
                     - name: sys
                       hostPath:
                         path: /sys
                     - name: proc-sys
                       hostPath:
                         path: /proc/sys
-                    - name: aperture-devices
-                      hostPath:
-                        path: /dev/aperture_devices
                     - name: dshm
                       emptyDir:
                         medium: Memory
@@ -125,8 +122,10 @@ spec:
                       env:
                         - name: LD_LIBRARY_PATH
                           value: /usr/local/nvidia/lib64
+                        {% if enable_tcpxo %}
                         - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
                           value: /dev/aperture_devices
+                        {% endif %}
                       {% if env_from_secrets and env_from_secrets|length > 0 %}
                       envFrom:
                         {% for s in env_from_secrets %}
@@ -144,10 +143,15 @@ spec:
                           {% if pvc.read_only %}readOnly: true{% endif %}
                         {% endfor %}
                         {% endif %}
-                        - name: dshm
-                          mountPath: /dev/shm
+                        - name: libraries
+                          mountPath: /usr/local/nvidia/lib64
+                          readOnly: true
+                        {% if enable_tcpxo %}
                         - name: aperture-devices
                           mountPath: /dev/aperture_devices
+                        {% endif %}
+                        - name: dshm
+                          mountPath: /dev/shm
                       resources:
                         requests:
                           {% if cpu_limit %}cpu: {{ cpu_limit }}{% endif %}
