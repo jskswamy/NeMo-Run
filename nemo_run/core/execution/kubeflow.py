@@ -238,8 +238,11 @@ class KubeflowExecutor(Executor):
     #: Detach mode flag (set by experiment framework)
     _detach_mode: bool = field(init=False, default=False)
 
-    #: Enable tcpxo sidecar and related mounts/env in runtime template
+    #: Enable TCPXO init sidecar and related mounts/env in runtime template
     enable_tcpxo: bool = False
+
+    #: Enable additional NCCL tuning envs when TCPXO is enabled
+    enable_tcpxo_nccl: bool = False
 
     storage_mounts: list["StorageMount"] = field(default_factory=list)
 
@@ -410,6 +413,7 @@ class KubeflowExecutor(Executor):
             "gpus": self.gpus_per_node,
             "num_proc_per_node": self.num_proc(),
             "enable_tcpxo": self.enable_tcpxo,
+            "enable_tcpxo_nccl": self.enable_tcpxo_nccl,
             "storage_pvc_mounts": self._get_normalized_storage_mounts(),
             "env_from_secrets": env_from_secrets,
         }
